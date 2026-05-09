@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use calamine::{Data, ExcelDateTime, Reader as _, Xlsx, open_workbook};
+use calamine::{Data, ExcelDateTime, Range, Reader as _, Xlsx, open_workbook};
 use quick_xml::{Reader as XmlReader, events::Event};
 use serde::Serialize;
 use zip::ZipArchive;
@@ -14,10 +14,16 @@ use zip::ZipArchive;
 #[derive(Debug, Clone)]
 pub(crate) struct WorkbookData {
     path: PathBuf,
-    sheet_name: Option<String>,
+    sheets: Vec<SheetData>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SheetData {
+    name: String,
     rows: Vec<Vec<CellData>>,
     column_widths: Vec<f32>,
     row_heights: Vec<f32>,
+    row_offsets: Vec<f32>,
     default_column_width: f32,
     default_row_height: f32,
     row_count: usize,
@@ -25,8 +31,74 @@ pub(crate) struct WorkbookData {
 }
 
 impl WorkbookData {
+    fn new(path: PathBuf, sheets: Vec<SheetData>) -> Self {
+        Self { path, sheets }
+    }
+
+    pub(crate) fn sheet_count(&self) -> usize {
+        self.sheets.len()
+    }
+
+    pub(crate) fn sheet(&self, sheet_ix: usize) -> &SheetData {
+        self.sheets
+            .get(sheet_ix)
+            .or_else(|| self.sheets.first())
+            .expect("workbook should contain at least one sheet")
+    }
+
+    pub(crate) fn sheet_name(&self, sheet_ix: usize) -> &str {
+        self.sheet(sheet_ix).name()
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.sheet(0).row_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn col_count(&self) -> usize {
+        self.sheet(0).col_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cell(&self, row: usize, col: usize) -> &str {
+        self.sheet(0).cell(row, col)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cell_data(&self, row: usize, col: usize) -> CellData {
+        self.sheet(0).cell_data(row, col)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn column_width(&self, col: usize) -> f32 {
+        self.sheet(0).column_width(col)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn row_height(&self, row: usize) -> f32 {
+        self.sheet(0).row_height(row)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sheet_height(&self) -> f32 {
+        self.sheet(0).sheet_height()
+    }
+
+    pub(crate) fn display_name(&self) -> String {
+        self.path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("spreadsheet")
+            .to_owned()
+    }
+
+    pub(crate) fn inspect(&self) -> InspectedSheet {
+        self.sheet(0).inspect()
+    }
+}
+
+impl SheetData {
     fn new(
-        path: PathBuf,
         sheet_name: Option<String>,
         rows: Vec<Vec<CellData>>,
         column_widths: Vec<f32>,
@@ -36,18 +108,23 @@ impl WorkbookData {
     ) -> Self {
         let row_count = rows.len();
         let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let row_offsets = build_row_offsets(row_count, &row_heights, default_row_height);
 
         Self {
-            path,
-            sheet_name,
+            name: sheet_name.unwrap_or_else(|| "Sheet1".to_owned()),
             rows,
             column_widths,
             row_heights,
+            row_offsets,
             default_column_width,
             default_row_height,
             row_count,
             col_count,
         }
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
     }
 
     pub(crate) fn row_count(&self) -> usize {
@@ -94,22 +171,8 @@ impl WorkbookData {
         (0..self.col_count).map(|col| self.column_width(col)).sum()
     }
 
-    #[cfg(test)]
     pub(crate) fn sheet_height(&self) -> f32 {
-        (0..self.row_count).map(|row| self.row_height(row)).sum()
-    }
-
-    pub(crate) fn display_name(&self) -> String {
-        let file_name = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("spreadsheet");
-
-        match &self.sheet_name {
-            Some(sheet_name) => format!("{file_name} - {sheet_name}"),
-            None => file_name.to_owned(),
-        }
+        self.row_offsets.last().copied().unwrap_or(0.0)
     }
 
     pub(crate) fn inspect(&self) -> InspectedSheet {
@@ -132,24 +195,251 @@ impl WorkbookData {
         }
 
         InspectedSheet {
-            sheet: self
-                .sheet_name
-                .clone()
-                .unwrap_or_else(|| self.display_name()),
+            sheet: self.name.clone(),
             rows: self.row_count,
             cols: self.col_count,
             cells,
         }
+    }
+
+    pub(crate) fn summary_for_range(&self, range: CellRange) -> SelectionSummary {
+        let mut summary = SelectionSummary {
+            selected_cells: range.cell_count(),
+            ..Default::default()
+        };
+
+        let range = range.normalized();
+        for row_ix in range.start.row..=range.end.row {
+            for col_ix in range.start.col..=range.end.col {
+                if let Some(value) = self.numeric_value(row_ix, col_ix) {
+                    summary.numeric_cells += 1;
+                    summary.sum += value;
+                    summary.min = Some(summary.min.map_or(value, |min| min.min(value)));
+                    summary.max = Some(summary.max.map_or(value, |max| max.max(value)));
+                }
+            }
+        }
+
+        summary
+    }
+
+    fn numeric_value(&self, row: usize, col: usize) -> Option<f64> {
+        self.rows
+            .get(row)
+            .and_then(|columns| columns.get(col))
+            .and_then(|cell| match cell.raw_value {
+                CellRawValue::Number(value) => Some(value),
+                _ => None,
+            })
+    }
+
+    pub(crate) fn row_offset_for_scroll_position(&self, scroll_position: f32) -> (usize, f32) {
+        let scroll_position = scroll_position.clamp(0.0, self.sheet_height());
+        let row_ix = self
+            .row_offsets
+            .partition_point(|offset| *offset <= scroll_position)
+            .saturating_sub(1)
+            .min(self.row_count);
+
+        if row_ix >= self.row_count {
+            return (self.row_count, 0.0);
+        }
+
+        (row_ix, scroll_position - self.row_offsets[row_ix])
+    }
+
+    pub(crate) fn scroll_position_for_row_offset(&self, row: usize, offset: f32) -> f32 {
+        if row >= self.row_count {
+            return self.sheet_height();
+        }
+
+        let row_offset = offset.clamp(0.0, self.row_height(row));
+        self.row_offsets[row] + row_offset
     }
 }
 
 pub(crate) const DEFAULT_COLUMN_WIDTH: f32 = 120.0;
 pub(crate) const DEFAULT_ROW_HEIGHT: f32 = 24.0;
 
+fn build_row_offsets(row_count: usize, row_heights: &[f32], default_row_height: f32) -> Vec<f32> {
+    let mut offsets = Vec::with_capacity(row_count + 1);
+    let mut current = 0.0;
+    offsets.push(current);
+
+    for row_ix in 0..row_count {
+        let height = row_heights
+            .get(row_ix)
+            .copied()
+            .filter(|height| *height > 0.0)
+            .unwrap_or(default_row_height);
+        current += height;
+        offsets.push(current);
+    }
+
+    offsets
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CellData {
     pub(crate) value: String,
+    pub(crate) formula: Option<String>,
+    pub(crate) raw_value: CellRawValue,
     pub(crate) style: CellStyle,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) enum CellRawValue {
+    #[default]
+    Empty,
+    Number(f64),
+    Bool(bool),
+    DateTime,
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CellCoord {
+    pub(crate) row: usize,
+    pub(crate) col: usize,
+}
+
+impl CellCoord {
+    pub(crate) const fn new(row: usize, col: usize) -> Self {
+        Self { row, col }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CellRange {
+    pub(crate) start: CellCoord,
+    pub(crate) end: CellCoord,
+}
+
+impl CellRange {
+    pub(crate) const fn single(coord: CellCoord) -> Self {
+        Self {
+            start: coord,
+            end: coord,
+        }
+    }
+
+    pub(crate) const fn new(start: CellCoord, end: CellCoord) -> Self {
+        Self { start, end }
+    }
+
+    pub(crate) fn normalized(self) -> Self {
+        Self {
+            start: CellCoord {
+                row: self.start.row.min(self.end.row),
+                col: self.start.col.min(self.end.col),
+            },
+            end: CellCoord {
+                row: self.start.row.max(self.end.row),
+                col: self.start.col.max(self.end.col),
+            },
+        }
+    }
+
+    pub(crate) fn contains(self, row: usize, col: usize) -> bool {
+        let normalized = self.normalized();
+        row >= normalized.start.row
+            && row <= normalized.end.row
+            && col >= normalized.start.col
+            && col <= normalized.end.col
+    }
+
+    pub(crate) fn intersects_row(self, row: usize) -> bool {
+        let normalized = self.normalized();
+        row >= normalized.start.row && row <= normalized.end.row
+    }
+
+    pub(crate) fn intersects_col(self, col: usize) -> bool {
+        let normalized = self.normalized();
+        col >= normalized.start.col && col <= normalized.end.col
+    }
+
+    pub(crate) fn edge_sides(self, row: usize, col: usize) -> SelectionEdgeSides {
+        let normalized = self.normalized();
+        if !self.contains(row, col) {
+            return SelectionEdgeSides::default();
+        }
+
+        let mut edges = SelectionEdgeSides::default();
+        if row == normalized.start.row {
+            edges.insert_top();
+        }
+        if col == normalized.end.col {
+            edges.insert_right();
+        }
+        if row == normalized.end.row {
+            edges.insert_bottom();
+        }
+        if col == normalized.start.col {
+            edges.insert_left();
+        }
+        edges
+    }
+
+    pub(crate) fn cell_count(self) -> usize {
+        let normalized = self.normalized();
+        (normalized.end.row - normalized.start.row + 1)
+            * (normalized.end.col - normalized.start.col + 1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SelectionEdgeSides(u8);
+
+impl SelectionEdgeSides {
+    const TOP: u8 = 1;
+    const RIGHT: u8 = 1 << 1;
+    const BOTTOM: u8 = 1 << 2;
+    const LEFT: u8 = 1 << 3;
+
+    fn insert_top(&mut self) {
+        self.0 |= Self::TOP;
+    }
+
+    fn insert_right(&mut self) {
+        self.0 |= Self::RIGHT;
+    }
+
+    fn insert_bottom(&mut self) {
+        self.0 |= Self::BOTTOM;
+    }
+
+    fn insert_left(&mut self) {
+        self.0 |= Self::LEFT;
+    }
+
+    pub(crate) fn top(self) -> bool {
+        self.0 & Self::TOP != 0
+    }
+
+    pub(crate) fn right(self) -> bool {
+        self.0 & Self::RIGHT != 0
+    }
+
+    pub(crate) fn bottom(self) -> bool {
+        self.0 & Self::BOTTOM != 0
+    }
+
+    pub(crate) fn left(self) -> bool {
+        self.0 & Self::LEFT != 0
+    }
+
+    pub(crate) fn any(self) -> bool {
+        self.0 != 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct SelectionSummary {
+    pub(crate) selected_cells: usize,
+    pub(crate) numeric_cells: usize,
+    pub(crate) sum: f64,
+    pub(crate) min: Option<f64>,
+    pub(crate) max: Option<f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -219,12 +509,14 @@ fn load_csv(path: &Path) -> Result<WorkbookData> {
 
     Ok(WorkbookData::new(
         path.to_owned(),
-        None,
-        rows,
-        Vec::new(),
-        Vec::new(),
-        DEFAULT_COLUMN_WIDTH,
-        DEFAULT_ROW_HEIGHT,
+        vec![SheetData::new(
+            None,
+            rows,
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        )],
     ))
 }
 
@@ -233,44 +525,81 @@ fn load_xlsx(path: &Path) -> Result<WorkbookData> {
         .with_context(|| format!("failed to read XLSX metadata from {}", path.display()))?;
     let mut workbook: Xlsx<_> = open_workbook(path)
         .with_context(|| format!("failed to open XLSX file {}", path.display()))?;
-    let sheet_name = workbook
-        .sheet_names()
-        .first()
+    let sheet_names = workbook.sheet_names().clone();
+    if sheet_names.is_empty() {
+        bail!("XLSX file {} does not contain any sheets", path.display());
+    }
+
+    let mut sheets = Vec::with_capacity(sheet_names.len());
+    for sheet_name in sheet_names {
+        let range = workbook.worksheet_range(&sheet_name).with_context(|| {
+            format!(
+                "failed to read sheet '{sheet_name}' from {}",
+                path.display()
+            )
+        })?;
+        let formulas = workbook
+            .worksheet_formula(&sheet_name)
+            .with_context(|| {
+                format!(
+                    "failed to read formulas from sheet '{sheet_name}' in {}",
+                    path.display()
+                )
+            })
+            .unwrap_or_else(|_| Range::default());
+        let sheet_metadata = xlsx_metadata.sheet_metadata(&sheet_name);
+
+        let rows = range
+            .rows()
+            .enumerate()
+            .map(|(row_ix, row)| {
+                row.iter()
+                    .enumerate()
+                    .map(|(col_ix, cell)| {
+                        let style = sheet_metadata.cell_style(row_ix, col_ix);
+                        CellData {
+                            value: display_cell(cell, style.display_format.as_ref()),
+                            formula: formula_at(&formulas, row_ix, col_ix),
+                            raw_value: raw_value(cell),
+                            style: style.visual_style.clone(),
+                        }
+                    })
+                    .collect()
+            })
+            .collect();
+
+        sheets.push(SheetData::new(
+            Some(sheet_name.clone()),
+            rows,
+            sheet_metadata.column_widths,
+            sheet_metadata.row_heights,
+            sheet_metadata.default_column_width,
+            sheet_metadata.default_row_height,
+        ));
+    }
+
+    Ok(WorkbookData::new(path.to_owned(), sheets))
+}
+
+fn formula_at(formulas: &Range<String>, row_ix: usize, col_ix: usize) -> Option<String> {
+    let row_ix = u32::try_from(row_ix).ok()?;
+    let col_ix = u32::try_from(col_ix).ok()?;
+
+    formulas
+        .get_value((row_ix, col_ix))
+        .filter(|formula| !formula.is_empty())
         .cloned()
-        .ok_or_else(|| anyhow!("XLSX file {} does not contain any sheets", path.display()))?;
-    let range = workbook.worksheet_range(&sheet_name).with_context(|| {
-        format!(
-            "failed to read sheet '{sheet_name}' from {}",
-            path.display()
-        )
-    })?;
+}
 
-    let rows = range
-        .rows()
-        .enumerate()
-        .map(|(row_ix, row)| {
-            row.iter()
-                .enumerate()
-                .map(|(col_ix, cell)| {
-                    let style = xlsx_metadata.cell_style(row_ix, col_ix);
-                    CellData {
-                        value: display_cell(cell, style.display_format.as_ref()),
-                        style: style.visual_style.clone(),
-                    }
-                })
-                .collect()
-        })
-        .collect();
-
-    Ok(WorkbookData::new(
-        path.to_owned(),
-        Some(sheet_name),
-        rows,
-        xlsx_metadata.column_widths,
-        xlsx_metadata.row_heights,
-        xlsx_metadata.default_column_width,
-        xlsx_metadata.default_row_height,
-    ))
+fn raw_value(cell: &Data) -> CellRawValue {
+    match cell {
+        Data::Empty => CellRawValue::Empty,
+        Data::Float(value) => CellRawValue::Number(*value),
+        Data::Int(value) => CellRawValue::Number(*value as f64),
+        Data::Bool(value) => CellRawValue::Bool(*value),
+        Data::DateTime(_) | Data::DateTimeIso(_) | Data::DurationIso(_) => CellRawValue::DateTime,
+        _ => CellRawValue::Text,
+    }
 }
 
 fn display_cell(cell: &Data, format: Option<&CellDisplayFormat>) -> String {
@@ -403,11 +732,7 @@ struct XlsxStyle {
 
 #[derive(Debug, Default)]
 struct XlsxMetadata {
-    cell_styles: HashMap<(usize, usize), XlsxCellStyle>,
-    column_widths: Vec<f32>,
-    row_heights: Vec<f32>,
-    default_column_width: f32,
-    default_row_height: f32,
+    sheets: HashMap<String, SheetMetadata>,
 }
 
 impl XlsxMetadata {
@@ -418,27 +743,32 @@ impl XlsxMetadata {
             .with_context(|| format!("failed to read XLSX archive {}", path.display()))?;
 
         let styles = read_styles(&mut archive)?;
-        let sheet_path = first_sheet_path(&mut archive)?;
-        let sheet_metadata = read_sheet_metadata(&mut archive, &sheet_path, &styles)?;
+        let sheet_paths = workbook_sheet_paths(&mut archive)?;
+        let mut sheets = HashMap::new();
 
-        Ok(Self {
-            cell_styles: sheet_metadata.cell_styles,
-            column_widths: sheet_metadata.column_widths,
-            row_heights: sheet_metadata.row_heights,
-            default_column_width: sheet_metadata.default_column_width,
-            default_row_height: sheet_metadata.default_row_height,
-        })
+        for (sheet_name, sheet_path) in sheet_paths {
+            let sheet_metadata = read_sheet_metadata(&mut archive, &sheet_path, &styles)?;
+            sheets.insert(sheet_name, sheet_metadata);
+        }
+
+        Ok(Self { sheets })
     }
 
+    fn sheet_metadata(&self, sheet_name: &str) -> SheetMetadata {
+        self.sheets.get(sheet_name).cloned().unwrap_or_default()
+    }
+
+    #[cfg(test)]
     fn cell_style(&self, row: usize, col: usize) -> XlsxCellStyle {
-        self.cell_styles
-            .get(&(row, col))
-            .cloned()
+        self.sheets
+            .values()
+            .next()
+            .map(|sheet| sheet.cell_style(row, col))
             .unwrap_or_default()
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SheetMetadata {
     cell_styles: HashMap<(usize, usize), XlsxCellStyle>,
     column_widths: Vec<f32>,
@@ -456,6 +786,15 @@ impl Default for SheetMetadata {
             default_column_width: DEFAULT_COLUMN_WIDTH,
             default_row_height: DEFAULT_ROW_HEIGHT,
         }
+    }
+}
+
+impl SheetMetadata {
+    fn cell_style(&self, row: usize, col: usize) -> XlsxCellStyle {
+        self.cell_styles
+            .get(&(row, col))
+            .cloned()
+            .unwrap_or_default()
     }
 }
 
@@ -598,50 +937,69 @@ fn builtin_number_formats() -> HashMap<usize, String> {
     .collect()
 }
 
-fn first_sheet_path(archive: &mut ZipArchive<File>) -> Result<String> {
+fn workbook_sheet_paths(archive: &mut ZipArchive<File>) -> Result<Vec<(String, String)>> {
     let workbook_xml = read_zip_text(archive, "xl/workbook.xml")?
         .ok_or_else(|| anyhow!("XLSX archive is missing xl/workbook.xml"))?;
     let workbook_rels_xml = read_zip_text(archive, "xl/_rels/workbook.xml.rels")?
         .ok_or_else(|| anyhow!("XLSX archive is missing xl/_rels/workbook.xml.rels"))?;
 
-    let first_sheet_rel = first_sheet_relationship_id(&workbook_xml)?
-        .ok_or_else(|| anyhow!("XLSX workbook does not contain any sheets"))?;
-    let target = relationship_target(&workbook_rels_xml, &first_sheet_rel)?
-        .ok_or_else(|| anyhow!("XLSX workbook is missing first sheet relationship"))?;
+    let relationships = relationships_by_id(&workbook_rels_xml)?;
+    let mut sheets = Vec::new();
+    for (sheet_name, relationship_id) in workbook_sheet_relationships(&workbook_xml)? {
+        let target = relationships.get(&relationship_id).ok_or_else(|| {
+            anyhow!("XLSX workbook is missing sheet relationship {relationship_id}")
+        })?;
+        sheets.push((sheet_name, normalize_workbook_target(target)));
+    }
 
-    Ok(normalize_workbook_target(&target))
+    if sheets.is_empty() {
+        bail!("XLSX workbook does not contain any sheets");
+    }
+
+    Ok(sheets)
 }
 
-fn first_sheet_relationship_id(workbook_xml: &str) -> Result<Option<String>> {
+fn workbook_sheet_relationships(workbook_xml: &str) -> Result<Vec<(String, String)>> {
     let mut reader = XmlReader::from_str(workbook_xml);
     reader.config_mut().trim_text(true);
+    let mut sheets = Vec::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(event) | Event::Empty(event)
                 if event.local_name().as_ref() == b"sheet" =>
             {
-                return attr_string(&reader, &event, b"id");
+                if let (Some(name), Some(relationship_id)) = (
+                    attr_string(&reader, &event, b"name")?,
+                    attr_string(&reader, &event, b"id")?,
+                ) {
+                    sheets.push((name, relationship_id));
+                }
             }
-            Event::Eof => return Ok(None),
+            Event::Eof => return Ok(sheets),
             _ => {}
         }
     }
 }
 
-fn relationship_target(rels_xml: &str, relationship_id: &str) -> Result<Option<String>> {
+fn relationships_by_id(rels_xml: &str) -> Result<HashMap<String, String>> {
     let mut reader = XmlReader::from_str(rels_xml);
     reader.config_mut().trim_text(true);
+    let mut relationships = HashMap::new();
 
     loop {
         match reader.read_event()? {
             Event::Start(event) | Event::Empty(event)
-                if event.local_name().as_ref() == b"Relationship"
-                    && attr_string(&reader, &event, b"Id")?.as_deref() == Some(relationship_id) =>
+                if event.local_name().as_ref() == b"Relationship" =>
             {
-                return attr_string(&reader, &event, b"Target");
+                if let (Some(id), Some(target)) = (
+                    attr_string(&reader, &event, b"Id")?,
+                    attr_string(&reader, &event, b"Target")?,
+                ) {
+                    relationships.insert(id, target);
+                }
             }
-            Event::Eof => return Ok(None),
+            Event::Eof => return Ok(relationships),
             _ => {}
         }
     }
@@ -970,16 +1328,17 @@ mod tests {
         write_metadata_xlsx(&path, styles_xml, sheet_xml);
 
         let metadata = XlsxMetadata::read(&path).unwrap();
+        let sheet_metadata = metadata.sheet_metadata("Sheet1");
         let style = metadata.cell_style(3, 0).visual_style;
 
         assert!(style.bold);
         assert_eq!(style.text_color, Some(0x11_22_33));
         assert_eq!(style.background_color, Some(0xaa_bb_cc));
-        assert!((metadata.default_column_width - excel_column_width_to_px(9.0)).abs() < 0.01);
-        assert!((metadata.column_widths[1] - excel_column_width_to_px(20.0)).abs() < 0.01);
-        assert!((metadata.column_widths[2] - excel_column_width_to_px(20.0)).abs() < 0.01);
-        assert!((metadata.default_row_height - points_to_px(18.0)).abs() < 0.01);
-        assert!((metadata.row_heights[3] - points_to_px(30.0)).abs() < 0.01);
+        assert!((sheet_metadata.default_column_width - excel_column_width_to_px(9.0)).abs() < 0.01);
+        assert!((sheet_metadata.column_widths[1] - excel_column_width_to_px(20.0)).abs() < 0.01);
+        assert!((sheet_metadata.column_widths[2] - excel_column_width_to_px(20.0)).abs() < 0.01);
+        assert!((sheet_metadata.default_row_height - points_to_px(18.0)).abs() < 0.01);
+        assert!((sheet_metadata.row_heights[3] - points_to_px(30.0)).abs() < 0.01);
 
         fs::remove_file(path).unwrap();
     }
@@ -1006,6 +1365,64 @@ mod tests {
 
         assert_eq!(one_decimal.format_number(0.152), "15.2%");
         assert_eq!(two_decimals.format_number(1.137_370_086), "113.74%");
+    }
+
+    #[test]
+    fn selection_summary_counts_cells_and_numeric_values() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![
+                vec![
+                    CellData {
+                        value: "1".to_owned(),
+                        raw_value: CellRawValue::Number(1.0),
+                        ..Default::default()
+                    },
+                    CellData {
+                        value: "text".to_owned(),
+                        raw_value: CellRawValue::Text,
+                        ..Default::default()
+                    },
+                ],
+                vec![
+                    CellData {
+                        value: "3".to_owned(),
+                        raw_value: CellRawValue::Number(3.0),
+                        ..Default::default()
+                    },
+                    CellData {
+                        value: "2026-01-01".to_owned(),
+                        raw_value: CellRawValue::DateTime,
+                        ..Default::default()
+                    },
+                ],
+            ],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        let summary =
+            sheet.summary_for_range(CellRange::new(CellCoord::new(0, 0), CellCoord::new(1, 1)));
+
+        assert_eq!(summary.selected_cells, 4);
+        assert_eq!(summary.numeric_cells, 2);
+        assert!((summary.sum - 4.0).abs() < f64::EPSILON);
+        assert_eq!(summary.min, Some(1.0));
+        assert_eq!(summary.max, Some(3.0));
+    }
+
+    #[test]
+    fn cell_range_identifies_selection_edges() {
+        let range = CellRange::new(CellCoord::new(1, 1), CellCoord::new(3, 3));
+
+        assert!(range.edge_sides(1, 2).top());
+        assert!(range.edge_sides(2, 1).left());
+        assert!(range.edge_sides(3, 2).bottom());
+        assert!(range.edge_sides(2, 3).right());
+        assert!(!range.edge_sides(2, 2).any());
+        assert!(!range.edge_sides(4, 2).any());
     }
 
     fn temp_file(name: &str) -> PathBuf {
