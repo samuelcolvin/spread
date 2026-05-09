@@ -1,0 +1,25 @@
+[package]
+name = "spread"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+calamine = "0.34"
+csv = "1.4"
+gpui = "0.2.2"
+quick-xml = "0.39"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+zip = "7.2"
+
+[lints.clippy]
+# in general we lint against the pedantic group, but we will whitelist
+# certain lints which we don't want to enforce
+pedantic = { level = "warn", priority = -1 }
+cast_precision_loss = "allow"
+doc_markdown = "allow"
+match_same_arms = "allow"
+missing_errors_doc = "allow"
+similar_names = "allow"
+too_many_lines = "allow"
