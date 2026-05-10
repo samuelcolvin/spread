@@ -4,8 +4,8 @@ use anyhow::{Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use gpui::{
-    App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, prelude::*,
-    px, size,
+    App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point,
+    prelude::*, px, size,
 };
 
 use crate::{
@@ -85,7 +85,8 @@ fn run(cli: &Cli) -> Result<()> {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
                     title: Some(title.clone().into()),
-                    ..Default::default()
+                    appears_transparent: true,
+                    traffic_light_position: Some(point(px(16.0), px(13.0))),
                 }),
                 ..Default::default()
             },

@@ -24,11 +24,13 @@ const HEADER_TEXT: u32 = 0x3c_40_43;
 const SHEET_BG: u32 = 0xfa_fa_fa;
 const CELL_BG: u32 = 0xff_ff_ff;
 const CELL_TEXT: u32 = 0x20_21_24;
+const TITLE_BAR_BG: u32 = 0xf3_f4_f7;
 const FORMULA_FALLBACK_TEXT: u32 = 0x5f_63_68;
 const SELECTED_CELL_BG: u32 = 0xe8_f0_fe;
 const ACTIVE_CELL_BG: u32 = 0xd2_e3_fc;
 const SELECTION_BORDER: u32 = 0x1a_73_e8;
 const SELECTION_INNER_BORDER: u32 = 0xa8_c7_fa;
+const TITLE_BAR_HEIGHT: f32 = 40.0;
 const FORMULA_BAR_HEIGHT: f32 = 36.0;
 const FOOTER_HEIGHT: f32 = 32.0;
 const RESIZE_HANDLE_SIZE: f32 = 6.0;
@@ -579,6 +581,7 @@ impl Render for SpreadsheetViewer {
                     });
                 }
             })
+            .child(title_bar(workbook.as_ref(), sheet_ix))
             .child(formula_bar(workbook.sheet(sheet_ix), selection))
             .child(
                 div()
@@ -634,6 +637,38 @@ impl Render for SpreadsheetViewer {
             )
             .child(footer(self, cx))
     }
+}
+
+fn title_bar(workbook: &WorkbookData, sheet_ix: usize) -> Div {
+    div()
+        .h(px(TITLE_BAR_HEIGHT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .pl(px(78.0))
+        .pr(px(12.0))
+        .bg(rgb(TITLE_BAR_BG))
+        .border_b_1()
+        .border_color(rgb(GRID_COLOR))
+        .text_color(rgb(HEADER_TEXT))
+        .on_mouse_down(MouseButton::Left, |_, window, _| {
+            window.start_window_move();
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .overflow_hidden()
+                .whitespace_nowrap()
+                .child(
+                    div()
+                        .font_weight(FontWeight::BOLD)
+                        .child(workbook.display_name()),
+                )
+                .child(div().text_color(rgb(FORMULA_FALLBACK_TEXT)).child("/"))
+                .child(workbook.sheet_name(sheet_ix).to_owned()),
+        )
 }
 
 fn column_header_pane(
