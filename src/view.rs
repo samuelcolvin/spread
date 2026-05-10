@@ -4,8 +4,8 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Div, Entity, FocusHandle, Focusable, FontWeight, IntoElement,
-    ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    AnyElement, App, Bounds, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, FontWeight,
+    IntoElement, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, Point, Render, ScrollHandle, Stateful, Window, actions, canvas, div,
     list, point, prelude::*, px, rgb,
 };
@@ -31,6 +31,9 @@ const SELECTION_BORDER: u32 = 0x1a_73_e8;
 const SELECTION_INNER_BORDER: u32 = 0xa8_c7_fa;
 const FORMULA_BAR_HEIGHT: f32 = 36.0;
 const FOOTER_HEIGHT: f32 = 32.0;
+const RESIZE_HANDLE_SIZE: f32 = 6.0;
+const MIN_COLUMN_WIDTH: f32 = 24.0;
+const MIN_ROW_HEIGHT: f32 = 18.0;
 const VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) const WINDOW_WIDTH: f32 = 1100.0;
@@ -49,6 +52,8 @@ pub(crate) struct SpreadsheetViewer {
     horizontal_scroll: ScrollHandle,
     body_list: ListState,
     scrollbar_drag: Option<ScrollbarDrag>,
+    resize_drag: Option<ResizeDrag>,
+    layouts: Vec<SheetLayout>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +130,111 @@ enum ScrollbarDrag {
     },
 }
 
+#[derive(Clone)]
+struct SheetLayout {
+    column_widths: Vec<f32>,
+    row_heights: Vec<f32>,
+    row_offsets: Vec<f32>,
+    sheet_width: f32,
+}
+
+impl SheetLayout {
+    fn new(sheet: &SheetData) -> Self {
+        let column_widths = (0..sheet.col_count())
+            .map(|col_ix| sheet.column_width(col_ix))
+            .collect::<Vec<_>>();
+        let row_heights = (0..sheet.row_count())
+            .map(|row_ix| sheet.row_height(row_ix))
+            .collect::<Vec<_>>();
+        let row_offsets = row_offsets_for_heights(&row_heights);
+        let sheet_width = column_widths.iter().sum();
+
+        Self {
+            column_widths,
+            row_heights,
+            row_offsets,
+            sheet_width,
+        }
+    }
+
+    fn column_width(&self, col: usize) -> f32 {
+        self.column_widths
+            .get(col)
+            .copied()
+            .unwrap_or(MIN_COLUMN_WIDTH)
+    }
+
+    fn row_height(&self, row: usize) -> f32 {
+        self.row_heights.get(row).copied().unwrap_or(MIN_ROW_HEIGHT)
+    }
+
+    fn sheet_height(&self) -> f32 {
+        self.row_offsets.last().copied().unwrap_or(0.0)
+    }
+
+    fn scroll_position_for_row_offset(&self, row_ix: usize, offset_in_row: f32) -> f32 {
+        self.row_offsets.get(row_ix).copied().unwrap_or(0.0) + offset_in_row
+    }
+
+    fn row_offset_for_scroll_position(&self, position: f32) -> (usize, f32) {
+        if self.row_heights.is_empty() {
+            return (0, 0.0);
+        }
+
+        let row_ix = self
+            .row_offsets
+            .partition_point(|offset| *offset <= position);
+        let row_ix = row_ix.saturating_sub(1).min(self.row_heights.len() - 1);
+        let row_start = self.row_offsets.get(row_ix).copied().unwrap_or(0.0);
+        (row_ix, (position - row_start).max(0.0))
+    }
+
+    fn set_column_widths(&mut self, updates: &[(usize, f32)]) {
+        for (col_ix, width) in updates {
+            if let Some(column_width) = self.column_widths.get_mut(*col_ix) {
+                *column_width = width.max(MIN_COLUMN_WIDTH);
+            }
+        }
+        self.sheet_width = self.column_widths.iter().sum();
+    }
+
+    fn set_row_heights(&mut self, updates: &[(usize, f32)]) {
+        for (row_ix, height) in updates {
+            if let Some(row_height) = self.row_heights.get_mut(*row_ix) {
+                *row_height = height.max(MIN_ROW_HEIGHT);
+            }
+        }
+        self.row_offsets = row_offsets_for_heights(&self.row_heights);
+    }
+}
+
+fn row_offsets_for_heights(row_heights: &[f32]) -> Vec<f32> {
+    let mut offsets = Vec::with_capacity(row_heights.len() + 1);
+    let mut current = 0.0;
+    offsets.push(current);
+
+    for height in row_heights {
+        current += *height;
+        offsets.push(current);
+    }
+
+    offsets
+}
+
+#[derive(Clone, Debug)]
+enum ResizeDrag {
+    Columns {
+        start_x: Pixels,
+        columns: Vec<usize>,
+        start_widths: Vec<f32>,
+    },
+    Rows {
+        start_y: Pixels,
+        rows: Vec<usize>,
+        start_heights: Vec<f32>,
+    },
+}
+
 impl SpreadsheetViewer {
     pub(crate) fn new(
         workbook: Arc<WorkbookData>,
@@ -140,6 +250,10 @@ impl SpreadsheetViewer {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
 
+        let layouts = (0..workbook.sheet_count())
+            .map(|sheet_ix| SheetLayout::new(workbook.sheet(sheet_ix)))
+            .collect();
+
         Self {
             workbook,
             focus_handle,
@@ -151,11 +265,21 @@ impl SpreadsheetViewer {
             horizontal_scroll: ScrollHandle::new(),
             body_list,
             scrollbar_drag: None,
+            resize_drag: None,
+            layouts,
         }
     }
 
     fn active_sheet(&self) -> &SheetData {
         self.workbook.sheet(self.active_sheet)
+    }
+
+    fn active_layout(&self) -> &SheetLayout {
+        &self.layouts[self.active_sheet]
+    }
+
+    fn active_layout_mut(&mut self) -> &mut SheetLayout {
+        &mut self.layouts[self.active_sheet]
     }
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<'_, Self>) {
@@ -187,6 +311,7 @@ impl SpreadsheetViewer {
         let changed = self.selection != next_selection || self.show_summary_menu;
         self.selection = next_selection;
         self.selection_drag = Some(self.selection.anchor);
+        self.resize_drag = None;
         self.show_summary_menu = false;
         changed
     }
@@ -205,24 +330,36 @@ impl SpreadsheetViewer {
         false
     }
 
-    fn select_row(&mut self, row: usize) -> bool {
-        let max_col = self.active_sheet().col_count().saturating_sub(1);
+    fn select_col(&mut self, col: usize, extend: bool) -> bool {
+        let max_row = self.active_sheet().row_count().saturating_sub(1);
+        let anchor_col = if extend {
+            self.selection.anchor.col
+        } else {
+            col
+        };
         let next_selection =
-            Selection::select_range(CellCoord::new(row, 0), CellCoord::new(row, max_col));
+            Selection::select_range(CellCoord::new(0, anchor_col), CellCoord::new(max_row, col));
         let changed = self.selection != next_selection || self.show_summary_menu;
         self.selection = next_selection;
         self.selection_drag = None;
+        self.resize_drag = None;
         self.show_summary_menu = false;
         changed
     }
 
-    fn select_col(&mut self, col: usize) -> bool {
-        let max_row = self.active_sheet().row_count().saturating_sub(1);
+    fn select_row(&mut self, row: usize, extend: bool) -> bool {
+        let max_col = self.active_sheet().col_count().saturating_sub(1);
+        let anchor_row = if extend {
+            self.selection.anchor.row
+        } else {
+            row
+        };
         let next_selection =
-            Selection::select_range(CellCoord::new(0, col), CellCoord::new(max_row, col));
+            Selection::select_range(CellCoord::new(anchor_row, 0), CellCoord::new(row, max_col));
         let changed = self.selection != next_selection || self.show_summary_menu;
         self.selection = next_selection;
         self.selection_drag = None;
+        self.resize_drag = None;
         self.show_summary_menu = false;
         changed
     }
@@ -236,8 +373,134 @@ impl SpreadsheetViewer {
         let changed = self.selection != next_selection || self.show_summary_menu;
         self.selection = next_selection;
         self.selection_drag = None;
+        self.resize_drag = None;
         self.show_summary_menu = false;
         changed
+    }
+
+    fn start_column_resize(&mut self, col_ix: usize, pointer_x: Pixels) {
+        let columns = self.resize_columns_for_drag(col_ix);
+        let start_widths = columns
+            .iter()
+            .map(|col_ix| self.active_layout().column_width(*col_ix))
+            .collect();
+        self.selection_drag = None;
+        self.resize_drag = Some(ResizeDrag::Columns {
+            start_x: pointer_x,
+            columns,
+            start_widths,
+        });
+        self.show_summary_menu = false;
+    }
+
+    fn start_row_resize(&mut self, row_ix: usize, pointer_y: Pixels) {
+        let rows = self.resize_rows_for_drag(row_ix);
+        let start_heights = rows
+            .iter()
+            .map(|row_ix| self.active_layout().row_height(*row_ix))
+            .collect();
+        self.selection_drag = None;
+        self.resize_drag = Some(ResizeDrag::Rows {
+            start_y: pointer_y,
+            rows,
+            start_heights,
+        });
+        self.show_summary_menu = false;
+    }
+
+    fn drag_resize(&mut self, position: Point<Pixels>) -> bool {
+        let Some(resize_drag) = self.resize_drag.clone() else {
+            return false;
+        };
+
+        match resize_drag {
+            ResizeDrag::Columns {
+                start_x,
+                columns,
+                start_widths,
+            } => {
+                let delta = f32::from(position.x - start_x);
+                let updates = columns
+                    .into_iter()
+                    .zip(start_widths)
+                    .map(|(col_ix, start_width)| {
+                        (col_ix, (start_width + delta).max(MIN_COLUMN_WIDTH))
+                    })
+                    .collect::<Vec<_>>();
+                self.active_layout_mut().set_column_widths(&updates);
+            }
+            ResizeDrag::Rows {
+                start_y,
+                rows,
+                start_heights,
+            } => {
+                let delta = f32::from(position.y - start_y);
+                let updates = rows
+                    .into_iter()
+                    .zip(start_heights)
+                    .map(|(row_ix, start_height)| {
+                        (row_ix, (start_height + delta).max(MIN_ROW_HEIGHT))
+                    })
+                    .collect::<Vec<_>>();
+                self.active_layout_mut().set_row_heights(&updates);
+                self.invalidate_rows(updates.iter().map(|(row_ix, _)| *row_ix));
+            }
+        }
+
+        true
+    }
+
+    fn invalidate_rows(&self, rows: impl IntoIterator<Item = usize>) {
+        let mut rows = rows.into_iter().collect::<Vec<_>>();
+        if rows.is_empty() {
+            return;
+        }
+
+        rows.sort_unstable();
+        rows.dedup();
+
+        let mut range_start = rows[0];
+        let mut previous = rows[0];
+        for row_ix in rows.into_iter().skip(1) {
+            if row_ix == previous + 1 {
+                previous = row_ix;
+                continue;
+            }
+
+            self.body_list
+                .splice(range_start..previous + 1, previous + 1 - range_start);
+            range_start = row_ix;
+            previous = row_ix;
+        }
+
+        self.body_list
+            .splice(range_start..previous + 1, previous + 1 - range_start);
+    }
+
+    fn end_resize(&mut self) {
+        self.resize_drag = None;
+    }
+
+    fn resize_columns_for_drag(&self, col_ix: usize) -> Vec<usize> {
+        if self.selection.range.intersects_col(col_ix) {
+            let range = self.selection.range.normalized();
+            (range.start.col..=range.end.col)
+                .filter(|col_ix| *col_ix < self.active_sheet().col_count())
+                .collect()
+        } else {
+            vec![col_ix]
+        }
+    }
+
+    fn resize_rows_for_drag(&self, row_ix: usize) -> Vec<usize> {
+        if self.selection.range.intersects_row(row_ix) {
+            let range = self.selection.range.normalized();
+            (range.start.row..=range.end.row)
+                .filter(|row_ix| *row_ix < self.active_sheet().row_count())
+                .collect()
+        } else {
+            vec![row_ix]
+        }
     }
 
     fn vertical_scroll_position(&self) -> Pixels {
@@ -249,7 +512,7 @@ impl SpreadsheetViewer {
         }
 
         let scroll_top = self.body_list.logical_scroll_top();
-        px(self.active_sheet().scroll_position_for_row_offset(
+        px(self.active_layout().scroll_position_for_row_offset(
             scroll_top.item_ix,
             f32::from(scroll_top.offset_in_item),
         ))
@@ -257,7 +520,7 @@ impl SpreadsheetViewer {
 
     fn scroll_list_to_vertical_position(&self, list_state: &ListState, scroll_position: Pixels) {
         let (item_ix, offset_in_item) = self
-            .active_sheet()
+            .active_layout()
             .row_offset_for_scroll_position(f32::from(scroll_position));
         list_state.scroll_to(ListOffset {
             item_ix,
@@ -277,6 +540,7 @@ impl Render for SpreadsheetViewer {
         let workbook = Arc::clone(&self.workbook);
         let sheet_ix = self.active_sheet;
         let selection = self.selection;
+        let layout = self.active_layout().clone();
         let entity = cx.entity();
         let focus_handle = self.focus_handle.clone();
 
@@ -298,7 +562,22 @@ impl Render for SpreadsheetViewer {
             .on_mouse_up(MouseButton::Left, move |_, _, cx| {
                 entity.update(cx, |viewer, _| {
                     viewer.selection_drag = None;
+                    viewer.end_resize();
                 });
+            })
+            .on_mouse_move({
+                let entity = cx.entity();
+                move |event, _, cx| {
+                    if !event.dragging() {
+                        return;
+                    }
+
+                    entity.update(cx, |viewer, cx| {
+                        if viewer.drag_resize(event.position) {
+                            cx.notify();
+                        }
+                    });
+                }
             })
             .child(formula_bar(workbook.sheet(sheet_ix), selection))
             .child(
@@ -310,6 +589,7 @@ impl Render for SpreadsheetViewer {
                     .child(column_header_pane(
                         &workbook,
                         sheet_ix,
+                        &layout,
                         selection,
                         &self.horizontal_scroll,
                         &cx.entity(),
@@ -329,6 +609,7 @@ impl Render for SpreadsheetViewer {
                     .child(body_pane(
                         &workbook,
                         sheet_ix,
+                        layout.clone(),
                         selection,
                         &self.horizontal_scroll,
                         self.body_list.clone(),
@@ -358,6 +639,7 @@ impl Render for SpreadsheetViewer {
 fn column_header_pane(
     workbook: &Arc<WorkbookData>,
     sheet_ix: usize,
+    layout: &SheetLayout,
     selection: Selection,
     horizontal_scroll: &ScrollHandle,
     entity: &Entity<SpreadsheetViewer>,
@@ -378,6 +660,7 @@ fn column_header_pane(
             .child(column_headers(
                 &workbook,
                 sheet_ix,
+                layout,
                 selection,
                 &header_entity,
             )),
@@ -388,6 +671,7 @@ fn column_header_pane(
 fn body_pane(
     workbook: &Arc<WorkbookData>,
     sheet_ix: usize,
+    layout: SheetLayout,
     selection: Selection,
     horizontal_scroll: &ScrollHandle,
     body_list: ListState,
@@ -411,6 +695,7 @@ fn body_pane(
                 render_body_row(
                     &workbook,
                     sheet_ix,
+                    &layout,
                     row_ix,
                     row_horizontal_scroll.offset().x,
                     selection,
@@ -449,7 +734,7 @@ fn horizontal_scrollbar(
     cx: &mut Context<'_, SpreadsheetViewer>,
 ) -> AnyElement {
     let handle = viewer.horizontal_scroll.clone();
-    let content_width = px(viewer.active_sheet().sheet_width());
+    let content_width = px(viewer.active_layout().sheet_width);
 
     scrollbar_track("horizontal-scrollbar-track")
         .flex_1()
@@ -468,7 +753,7 @@ fn vertical_scrollbar(
     cx: &mut Context<'_, SpreadsheetViewer>,
 ) -> AnyElement {
     let viewport_height = viewer.body_list.viewport_bounds().size.height;
-    let content_height = px(viewer.active_sheet().sheet_height()).max(viewport_height);
+    let content_height = px(viewer.active_layout().sheet_height()).max(viewport_height);
     let scroll_position = viewer.vertical_scroll_position();
 
     scrollbar_track("vertical-scrollbar-track")
@@ -1017,13 +1302,14 @@ fn cell_address(coord: CellCoord) -> String {
 fn render_body_row(
     workbook: &WorkbookData,
     sheet_ix: usize,
+    layout: &SheetLayout,
     row_ix: usize,
     horizontal_offset: Pixels,
     selection: Selection,
     entity: &Entity<SpreadsheetViewer>,
 ) -> AnyElement {
     let sheet = workbook.sheet(sheet_ix);
-    let row_height = sheet.row_height(row_ix);
+    let row_height = layout.row_height(row_ix);
 
     div()
         .id(("sheet-row", row_ix))
@@ -1038,7 +1324,7 @@ fn render_body_row(
         ))
         .child(
             div().flex_1().h(px(row_height)).overflow_hidden().child(
-                render_cells_row(sheet, row_ix, row_height, selection, entity)
+                render_cells_row(sheet, layout, row_ix, row_height, selection, entity)
                     .relative()
                     .left(horizontal_offset),
             ),
@@ -1048,6 +1334,7 @@ fn render_body_row(
 
 fn render_cells_row(
     sheet: &SheetData,
+    layout: &SheetLayout,
     row_ix: usize,
     row_height: f32,
     selection: Selection,
@@ -1057,12 +1344,12 @@ fn render_cells_row(
         .id(("sheet-cells-row", row_ix))
         .flex()
         .h(px(row_height))
-        .w(px(sheet.sheet_width()));
+        .w(px(layout.sheet_width));
 
     for col_ix in 0..sheet.col_count() {
         row = row.child(cell(
             &sheet.cell_data(row_ix, col_ix),
-            sheet.column_width(col_ix),
+            layout.column_width(col_ix),
             row_height,
             CellRenderState {
                 coord: CellCoord::new(row_ix, col_ix),
@@ -1097,16 +1384,17 @@ fn corner_header(entity: Entity<SpreadsheetViewer>) -> Div {
 fn column_headers(
     workbook: &WorkbookData,
     sheet_ix: usize,
+    layout: &SheetLayout,
     selection: Selection,
     entity: &Entity<SpreadsheetViewer>,
 ) -> Div {
     let sheet = workbook.sheet(sheet_ix);
-    let mut row = div().flex().h(px(HEADER_HEIGHT)).w(px(sheet.sheet_width()));
+    let mut row = div().flex().h(px(HEADER_HEIGHT)).w(px(layout.sheet_width));
 
     for col_ix in 0..sheet.col_count() {
         row = row.child(column_header(
             column_name(col_ix),
-            sheet.column_width(col_ix),
+            layout.column_width(col_ix),
             col_ix,
             selection.range.intersects_col(col_ix),
             entity,
@@ -1124,6 +1412,8 @@ fn column_header(
     entity: &Entity<SpreadsheetViewer>,
 ) -> Div {
     let entity: Entity<SpreadsheetViewer> = (*entity).clone();
+    let resize_entity = entity.clone();
+    let drag_entity = entity.clone();
 
     div()
         .w(px(width))
@@ -1134,6 +1424,7 @@ fn column_header(
         .flex_none()
         .overflow_hidden()
         .whitespace_nowrap()
+        .relative()
         .bg(rgb(if selected {
             SELECTED_CELL_BG
         } else {
@@ -1148,9 +1439,37 @@ fn column_header(
         }))
         .text_color(rgb(HEADER_TEXT))
         .child(label)
-        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+        .child(
+            div()
+                .absolute()
+                .right(px(0.0))
+                .top(px(0.0))
+                .w(px(RESIZE_HANDLE_SIZE))
+                .h_full()
+                .cursor(CursorStyle::ResizeColumn)
+                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                    resize_entity.update(cx, |viewer, cx| {
+                        viewer.start_column_resize(col_ix, event.position.x);
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                })
+                .on_mouse_move(move |event, _, cx| {
+                    if !event.dragging() {
+                        return;
+                    }
+
+                    drag_entity.update(cx, |viewer, cx| {
+                        if viewer.drag_resize(event.position) {
+                            cx.notify();
+                        }
+                    });
+                    cx.stop_propagation();
+                }),
+        )
+        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
             entity.update(cx, |viewer, cx| {
-                if viewer.select_col(col_ix) {
+                if viewer.select_col(col_ix, event.modifiers.shift) {
                     cx.notify();
                 }
             });
@@ -1164,6 +1483,8 @@ fn row_header(
     entity: &Entity<SpreadsheetViewer>,
 ) -> Div {
     let entity: Entity<SpreadsheetViewer> = (*entity).clone();
+    let resize_entity = entity.clone();
+    let drag_entity = entity.clone();
 
     div()
         .w(px(ROW_HEADER_WIDTH))
@@ -1175,6 +1496,7 @@ fn row_header(
         .px_2()
         .overflow_hidden()
         .whitespace_nowrap()
+        .relative()
         .bg(rgb(if selected {
             SELECTED_CELL_BG
         } else {
@@ -1189,9 +1511,37 @@ fn row_header(
         }))
         .text_color(rgb(HEADER_TEXT))
         .child((row_ix + 1).to_string())
-        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+        .child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .bottom(px(0.0))
+                .w_full()
+                .h(px(RESIZE_HANDLE_SIZE))
+                .cursor(CursorStyle::ResizeRow)
+                .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                    resize_entity.update(cx, |viewer, cx| {
+                        viewer.start_row_resize(row_ix, event.position.y);
+                        cx.notify();
+                    });
+                    cx.stop_propagation();
+                })
+                .on_mouse_move(move |event, _, cx| {
+                    if !event.dragging() {
+                        return;
+                    }
+
+                    drag_entity.update(cx, |viewer, cx| {
+                        if viewer.drag_resize(event.position) {
+                            cx.notify();
+                        }
+                    });
+                    cx.stop_propagation();
+                }),
+        )
+        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
             entity.update(cx, |viewer, cx| {
-                if viewer.select_row(row_ix) {
+                if viewer.select_row(row_ix, event.modifiers.shift) {
                     cx.notify();
                 }
             });
@@ -1208,6 +1558,7 @@ fn cell(
     let entity: Entity<SpreadsheetViewer> = (*entity).clone();
     let highlighted = state.active || state.selected;
     let (cell_text, formula_fallback) = cell_display_text(cell);
+    let multiline = cell.style.wrap_text || cell_text.contains('\n');
     let text_color = if formula_fallback {
         FORMULA_FALLBACK_TEXT
     } else {
@@ -1222,11 +1573,9 @@ fn cell(
         .w(px(width))
         .h(px(row_height))
         .flex()
-        .items_center()
         .flex_none()
         .px_2()
         .overflow_hidden()
-        .whitespace_nowrap()
         .relative()
         .border_1()
         .border_color(rgb(border_color))
@@ -1238,6 +1587,12 @@ fn cell(
             cell.style.background_color.unwrap_or(CELL_BG)
         }))
         .text_color(rgb(text_color));
+
+    element = if multiline {
+        element.items_start().whitespace_normal()
+    } else {
+        element.items_center().whitespace_nowrap()
+    };
 
     element = element.border_l_0().border_t_0();
 
@@ -1444,5 +1799,33 @@ mod tests {
             cell_display_text(&cached_formula_cell),
             ("18".to_owned(), false)
         );
+    }
+
+    #[test]
+    fn sheet_layout_resizes_columns_and_rows_with_minimums() {
+        let mut layout = SheetLayout {
+            column_widths: vec![100.0, 120.0],
+            row_heights: vec![24.0, 30.0],
+            row_offsets: row_offsets_for_heights(&[24.0, 30.0]),
+            sheet_width: 220.0,
+        };
+
+        layout.set_column_widths(&[(0, 140.0), (1, 1.0)]);
+        layout.set_row_heights(&[(0, 40.0), (1, 1.0)]);
+
+        assert_float_eq(layout.column_width(0), 140.0);
+        assert_float_eq(layout.column_width(1), MIN_COLUMN_WIDTH);
+        assert_float_eq(layout.sheet_width, 140.0 + MIN_COLUMN_WIDTH);
+        assert_float_eq(layout.row_height(0), 40.0);
+        assert_float_eq(layout.row_height(1), MIN_ROW_HEIGHT);
+        assert_float_eq(layout.sheet_height(), 40.0 + MIN_ROW_HEIGHT);
+        let (row_ix, offset) = layout.row_offset_for_scroll_position(41.0);
+        assert_eq!(row_ix, 1);
+        assert_float_eq(offset, 1.0);
+        assert_float_eq(layout.scroll_position_for_row_offset(1, 3.0), 43.0);
+    }
+
+    fn assert_float_eq(left: f32, right: f32) {
+        assert!((left - right).abs() < f32::EPSILON, "{left} != {right}");
     }
 }

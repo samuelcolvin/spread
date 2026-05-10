@@ -25,7 +25,6 @@ pub(crate) struct SheetData {
     rows: Vec<Vec<CellData>>,
     column_widths: Vec<f32>,
     row_heights: Vec<f32>,
-    row_offsets: Vec<f32>,
     default_column_width: f32,
     default_row_height: f32,
     row_count: usize,
@@ -193,14 +192,20 @@ impl SheetData {
     ) -> Self {
         let row_count = rows.len();
         let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let row_offsets = build_row_offsets(row_count, &row_heights, default_row_height);
+        let row_heights = display_row_heights(
+            &rows,
+            row_heights,
+            &column_widths,
+            default_column_width,
+            default_row_height,
+            row_count,
+        );
 
         Self {
             name: sheet_name.unwrap_or_else(|| "Sheet1".to_owned()),
             rows,
             column_widths,
             row_heights,
-            row_offsets,
             default_column_width,
             default_row_height,
             row_count,
@@ -252,12 +257,11 @@ impl SheetData {
             .unwrap_or(self.default_row_height)
     }
 
-    pub(crate) fn sheet_width(&self) -> f32 {
-        (0..self.col_count).map(|col| self.column_width(col)).sum()
-    }
-
+    #[cfg(test)]
     pub(crate) fn sheet_height(&self) -> f32 {
-        self.row_offsets.last().copied().unwrap_or(0.0)
+        (0..self.row_count)
+            .map(|row_ix| self.row_height(row_ix))
+            .sum()
     }
 
     fn has_missing_formula_values(&self) -> bool {
@@ -429,30 +433,6 @@ impl SheetData {
                 _ => None,
             })
     }
-
-    pub(crate) fn row_offset_for_scroll_position(&self, scroll_position: f32) -> (usize, f32) {
-        let scroll_position = scroll_position.clamp(0.0, self.sheet_height());
-        let row_ix = self
-            .row_offsets
-            .partition_point(|offset| *offset <= scroll_position)
-            .saturating_sub(1)
-            .min(self.row_count);
-
-        if row_ix >= self.row_count {
-            return (self.row_count, 0.0);
-        }
-
-        (row_ix, scroll_position - self.row_offsets[row_ix])
-    }
-
-    pub(crate) fn scroll_position_for_row_offset(&self, row: usize, offset: f32) -> f32 {
-        if row >= self.row_count {
-            return self.sheet_height();
-        }
-
-        let row_offset = offset.clamp(0.0, self.row_height(row));
-        self.row_offsets[row] + row_offset
-    }
 }
 
 fn append_clipboard_cell(output: &mut String, value: &str) {
@@ -525,26 +505,98 @@ fn append_xml_attr(output: &mut String, value: &str) {
     }
 }
 
-pub(crate) const DEFAULT_COLUMN_WIDTH: f32 = 120.0;
-pub(crate) const DEFAULT_ROW_HEIGHT: f32 = 24.0;
+fn display_row_heights(
+    rows: &[Vec<CellData>],
+    mut row_heights: Vec<f32>,
+    column_widths: &[f32],
+    default_column_width: f32,
+    default_row_height: f32,
+    row_count: usize,
+) -> Vec<f32> {
+    row_heights.resize(row_count, 0.0);
 
-fn build_row_offsets(row_count: usize, row_heights: &[f32], default_row_height: f32) -> Vec<f32> {
-    let mut offsets = Vec::with_capacity(row_count + 1);
-    let mut current = 0.0;
-    offsets.push(current);
-
-    for row_ix in 0..row_count {
-        let height = row_heights
-            .get(row_ix)
-            .copied()
-            .filter(|height| *height > 0.0)
-            .unwrap_or(default_row_height);
-        current += height;
-        offsets.push(current);
+    for (row_ix, row_height) in row_heights.iter_mut().enumerate() {
+        if *row_height <= 0.0 {
+            *row_height = rows.get(row_ix).map_or(default_row_height, |row| {
+                auto_row_height(row, column_widths, default_column_width, default_row_height)
+            });
+        }
     }
 
-    offsets
+    row_heights
 }
+
+fn auto_row_height(
+    row: &[CellData],
+    column_widths: &[f32],
+    default_column_width: f32,
+    default_row_height: f32,
+) -> f32 {
+    let line_count = row
+        .iter()
+        .enumerate()
+        .map(|(col_ix, cell)| {
+            let width = column_widths
+                .get(col_ix)
+                .copied()
+                .filter(|width| *width > 0.0)
+                .unwrap_or(default_column_width);
+            estimated_cell_line_count(cell, width)
+        })
+        .max()
+        .unwrap_or(1);
+
+    if line_count <= 1 {
+        return default_row_height;
+    }
+
+    let line_height = (default_row_height - 4.0).max(14.0);
+    default_row_height + ((line_count - 1) as f32 * line_height)
+}
+
+fn estimated_cell_line_count(cell: &CellData, width: f32) -> usize {
+    if cell.value.is_empty() {
+        return 1;
+    }
+
+    let has_line_breaks = cell.value.contains('\n');
+    if !cell.style.wrap_text && !has_line_breaks {
+        return 1;
+    }
+
+    cell.value
+        .split('\n')
+        .map(|line| {
+            if cell.style.wrap_text {
+                wrapped_line_count(line, width)
+            } else {
+                1
+            }
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+fn wrapped_line_count(line: &str, width: f32) -> usize {
+    let available_width = (width - AUTO_ROW_HORIZONTAL_PADDING).max(AUTO_ROW_CHAR_WIDTH);
+    let mut line_count = 1;
+    let mut current_width = 0.0;
+
+    for _ in line.chars() {
+        if current_width > 0.0 && current_width + AUTO_ROW_CHAR_WIDTH > available_width {
+            line_count += 1;
+            current_width = 0.0;
+        }
+        current_width += AUTO_ROW_CHAR_WIDTH;
+    }
+
+    line_count
+}
+
+pub(crate) const DEFAULT_COLUMN_WIDTH: f32 = 120.0;
+pub(crate) const DEFAULT_ROW_HEIGHT: f32 = 24.0;
+const AUTO_ROW_CHAR_WIDTH: f32 = 7.0;
+const AUTO_ROW_HORIZONTAL_PADDING: f32 = 8.0;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CellData {
@@ -732,6 +784,7 @@ pub(crate) struct CellStyle {
     pub(crate) bold: bool,
     pub(crate) background_color: Option<u32>,
     pub(crate) text_color: Option<u32>,
+    pub(crate) wrap_text: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1248,6 +1301,7 @@ fn read_styles(archive: &mut ZipArchive<File>) -> Result<Vec<XlsxStyle>> {
     let mut fonts = Vec::new();
     let mut fills = Vec::new();
     let mut styles = Vec::new();
+    let mut pending_xf = None;
     let mut in_fonts = false;
     let mut in_font = false;
     let mut font = CellStyle::default();
@@ -1329,28 +1383,35 @@ fn read_styles(archive: &mut ZipArchive<File>) -> Result<Vec<XlsxStyle>> {
             {
                 fill_color = attr_rgb(&reader, &event)?;
             }
+            Event::Empty(event) if in_cell_xfs && event.local_name().as_ref() == b"xf" => {
+                styles.push(xlsx_style_from_xf(
+                    &reader,
+                    &event,
+                    &number_formats,
+                    &fonts,
+                    &fills,
+                )?);
+            }
+            Event::Start(event) if in_cell_xfs && event.local_name().as_ref() == b"xf" => {
+                pending_xf = Some(xlsx_style_from_xf(
+                    &reader,
+                    &event,
+                    &number_formats,
+                    &fonts,
+                    &fills,
+                )?);
+            }
             Event::Start(event) | Event::Empty(event)
-                if in_cell_xfs && event.local_name().as_ref() == b"xf" =>
+                if pending_xf.is_some() && event.local_name().as_ref() == b"alignment" =>
             {
-                let display_format = attr_usize(&reader, &event, b"numFmtId")?
-                    .and_then(|id| number_formats.get(&id))
-                    .and_then(|format_code| CellDisplayFormat::from_format_code(format_code));
-                let font_style = attr_usize(&reader, &event, b"fontId")?
-                    .and_then(|id| fonts.get(id))
-                    .cloned()
-                    .unwrap_or_default();
-                let background_color = attr_usize(&reader, &event, b"fillId")?
-                    .and_then(|id| fills.get(id))
-                    .copied()
-                    .flatten();
-
-                styles.push(XlsxStyle {
-                    display_format,
-                    visual_style: CellStyle {
-                        background_color,
-                        ..font_style
-                    },
-                });
+                if let Some(style) = pending_xf.as_mut()
+                    && attr_bool(&reader, &event, b"wrapText")?.unwrap_or(false)
+                {
+                    style.visual_style.wrap_text = true;
+                }
+            }
+            Event::End(event) if pending_xf.is_some() && event.local_name().as_ref() == b"xf" => {
+                styles.push(pending_xf.take().expect("pending xf should exist"));
             }
             Event::Eof => break,
             _ => {}
@@ -1358,6 +1419,34 @@ fn read_styles(archive: &mut ZipArchive<File>) -> Result<Vec<XlsxStyle>> {
     }
 
     Ok(styles)
+}
+
+fn xlsx_style_from_xf(
+    reader: &XmlReader<&[u8]>,
+    event: &quick_xml::events::BytesStart<'_>,
+    number_formats: &HashMap<usize, String>,
+    fonts: &[CellStyle],
+    fills: &[Option<u32>],
+) -> Result<XlsxStyle> {
+    let display_format = attr_usize(reader, event, b"numFmtId")?
+        .and_then(|id| number_formats.get(&id))
+        .and_then(|format_code| CellDisplayFormat::from_format_code(format_code));
+    let font_style = attr_usize(reader, event, b"fontId")?
+        .and_then(|id| fonts.get(id))
+        .cloned()
+        .unwrap_or_default();
+    let background_color = attr_usize(reader, event, b"fillId")?
+        .and_then(|id| fills.get(id))
+        .copied()
+        .flatten();
+
+    Ok(XlsxStyle {
+        display_format,
+        visual_style: CellStyle {
+            background_color,
+            ..font_style
+        },
+    })
 }
 
 fn builtin_number_formats() -> HashMap<usize, String> {
@@ -1614,6 +1703,15 @@ fn attr_f32(
         .transpose()
 }
 
+fn attr_bool(
+    reader: &XmlReader<&[u8]>,
+    event: &quick_xml::events::BytesStart<'_>,
+    name: &[u8],
+) -> Result<Option<bool>> {
+    Ok(attr_string(reader, event, name)?
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE")))
+}
+
 fn attr_rgb(
     reader: &XmlReader<&[u8]>,
     event: &quick_xml::events::BytesStart<'_>,
@@ -1699,6 +1797,37 @@ mod tests {
     }
 
     #[test]
+    fn multiline_cells_expand_auto_row_height_without_overriding_explicit_height() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![vec![CellData {
+                value: "line 1\nline 2\nline 3".to_owned(),
+                ..Default::default()
+            }]],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        assert!(sheet.row_height(0) > DEFAULT_ROW_HEIGHT);
+
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![vec![CellData {
+                value: "line 1\nline 2\nline 3".to_owned(),
+                ..Default::default()
+            }]],
+            Vec::new(),
+            vec![30.0],
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        assert!((sheet.row_height(0) - 30.0).abs() < 0.01);
+    }
+
+    #[test]
     fn loads_empty_csv_as_empty_grid() {
         let path = temp_file("spread-empty.csv");
         fs::write(&path, "").unwrap();
@@ -1745,6 +1874,8 @@ mod tests {
         assert!((workbook.column_width(0) - excel_column_width_to_px(18.38)).abs() < 0.01);
         assert!((workbook.column_width(6) - excel_column_width_to_px(12.63)).abs() < 0.01);
         assert!((workbook.row_height(0) - points_to_px(15.75)).abs() < 0.01);
+        let traction = workbook.sheet(workbook.sheet_index("Open source traction").unwrap());
+        assert!(traction.row_height(24) > DEFAULT_ROW_HEIGHT * 4.0);
         assert!(workbook.sheet_height() > 0.0);
     }
 
@@ -1902,7 +2033,7 @@ mod tests {
   </fills>
   <cellXfs count="2">
     <xf fontId="0" fillId="0" numFmtId="0"/>
-    <xf fontId="1" fillId="2" numFmtId="0"/>
+    <xf fontId="1" fillId="2" numFmtId="0"><alignment wrapText="1"/></xf>
   </cellXfs>
 </styleSheet>"#;
         let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -1922,6 +2053,7 @@ mod tests {
         assert!(style.bold);
         assert_eq!(style.text_color, Some(0x11_22_33));
         assert_eq!(style.background_color, Some(0xaa_bb_cc));
+        assert!(style.wrap_text);
         assert!((sheet_metadata.default_column_width - excel_column_width_to_px(9.0)).abs() < 0.01);
         assert!((sheet_metadata.column_widths[1] - excel_column_width_to_px(20.0)).abs() < 0.01);
         assert!((sheet_metadata.column_widths[2] - excel_column_width_to_px(20.0)).abs() < 0.01);
@@ -2052,6 +2184,7 @@ mod tests {
                     bold: true,
                     background_color: Some(0xaa_bb_cc),
                     text_color: Some(0x11_22_33),
+                    wrap_text: false,
                 },
                 ..Default::default()
             }]],
