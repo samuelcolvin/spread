@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
@@ -9,7 +10,6 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use calamine::{Data, ExcelDateTime, Range, Reader as _, Xlsx, open_workbook};
 use formualizer_workbook::{LiteralValue, Workbook as FormulaWorkbook};
 use quick_xml::{Reader as XmlReader, events::Event};
-#[cfg(feature = "debug")]
 use serde::Serialize;
 use zip::ZipArchive;
 
@@ -270,7 +270,6 @@ impl SheetData {
         })
     }
 
-    #[cfg(feature = "debug")]
     pub(crate) fn inspect(&self) -> InspectedSheet {
         let mut cells = Vec::with_capacity(self.row_count * self.col_count);
 
@@ -337,6 +336,44 @@ impl SheetData {
             }
         }
 
+        output
+    }
+
+    pub(crate) fn range_to_html(&self, range: CellRange) -> String {
+        let range = range.normalized();
+        let mut output = String::new();
+        output.push_str(
+            r#"<html><head><meta charset="utf-8"></head><body><table cellspacing="0" cellpadding="0" style="border-collapse:collapse;">"#,
+        );
+
+        for row_ix in range.start.row..=range.end.row {
+            write!(
+                output,
+                r#"<tr style="height:{:.2}px;">"#,
+                self.row_height(row_ix)
+            )
+            .expect("writing to String should not fail");
+
+            for col_ix in range.start.col..=range.end.col {
+                let cell = self.cell_data(row_ix, col_ix);
+                write!(
+                    output,
+                    r#"<td style="{}">"#,
+                    clipboard_html_cell_style(
+                        &cell,
+                        self.column_width(col_ix),
+                        self.row_height(row_ix)
+                    )
+                )
+                .expect("writing to String should not fail");
+                append_html_text(&mut output, &cell.value);
+                output.push_str("</td>");
+            }
+
+            output.push_str("</tr>");
+        }
+
+        output.push_str("</table></body></html>");
         output
     }
 
@@ -422,6 +459,44 @@ fn append_clipboard_cell(output: &mut String, value: &str) {
     for ch in value.chars() {
         match ch {
             '\t' | '\n' | '\r' => output.push(' '),
+            _ => output.push(ch),
+        }
+    }
+}
+
+fn clipboard_html_cell_style(cell: &CellData, width: f32, height: f32) -> String {
+    let font_weight = if cell.style.bold { "bold" } else { "normal" };
+    format!(
+        concat!(
+            "border:1px solid #d9d9d9;",
+            "padding:2px 8px;",
+            "min-width:{:.2}px;",
+            "width:{:.2}px;",
+            "height:{:.2}px;",
+            "color:#{};",
+            "background-color:#{};",
+            "font-weight:{};",
+            "font-family:Arial,sans-serif;",
+            "font-size:13px;",
+            "white-space:pre-wrap;"
+        ),
+        width,
+        width,
+        height,
+        css_color(cell.style.text_color.unwrap_or(0x20_21_24)),
+        css_color(cell.style.background_color.unwrap_or(0xff_ff_ff)),
+        font_weight,
+    )
+}
+
+fn append_html_text(output: &mut String, value: &str) {
+    for ch in value.chars() {
+        match ch {
+            '&' => output.push_str("&amp;"),
+            '<' => output.push_str("&lt;"),
+            '>' => output.push_str("&gt;"),
+            '"' => output.push_str("&quot;"),
+            '\'' => output.push_str("&#39;"),
             _ => output.push(ch),
         }
     }
@@ -659,7 +734,6 @@ pub(crate) struct CellStyle {
     pub(crate) text_color: Option<u32>,
 }
 
-#[cfg(feature = "debug")]
 #[derive(Debug, Serialize)]
 pub(crate) struct InspectedSheet {
     sheet: String,
@@ -668,7 +742,6 @@ pub(crate) struct InspectedSheet {
     cells: Vec<InspectedCell>,
 }
 
-#[cfg(feature = "debug")]
 #[derive(Debug, Serialize)]
 struct InspectedCell {
     x: String,
@@ -1556,12 +1629,14 @@ fn parse_argb_color(value: &str) -> Option<u32> {
     u32::from_str_radix(rgb, 16).ok()
 }
 
-#[cfg(feature = "debug")]
 fn color_hex(color: u32) -> String {
     format!("{color:06x}")
 }
 
-#[cfg(feature = "debug")]
+fn css_color(color: u32) -> String {
+    format!("{color:06x}")
+}
+
 fn round2(value: f32) -> f32 {
     (value * 100.0).round() / 100.0
 }
@@ -1965,6 +2040,36 @@ mod tests {
         let copied = sheet.range_to_tsv(CellRange::new(CellCoord::new(1, 1), CellCoord::new(0, 0)));
 
         assert_eq!(copied, "2026-01-01\t$1,234.50\nline break\t15.2%");
+    }
+
+    #[test]
+    fn range_to_html_includes_display_values_and_cell_styles() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![vec![CellData {
+                value: "Ada & <Grace>".to_owned(),
+                style: CellStyle {
+                    bold: true,
+                    background_color: Some(0xaa_bb_cc),
+                    text_color: Some(0x11_22_33),
+                },
+                ..Default::default()
+            }]],
+            vec![80.0],
+            vec![28.0],
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        let copied = sheet.range_to_html(CellRange::single(CellCoord::new(0, 0)));
+
+        assert!(copied.contains("<table"));
+        assert!(copied.contains("Ada &amp; &lt;Grace&gt;"));
+        assert!(copied.contains("color:#112233;"));
+        assert!(copied.contains("background-color:#aabbcc;"));
+        assert!(copied.contains("font-weight:bold;"));
+        assert!(copied.contains("width:80.00px;"));
+        assert!(copied.contains("height:28.00px;"));
     }
 
     #[test]

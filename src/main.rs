@@ -36,15 +36,13 @@ fn run(cli: &Cli) -> Result<()> {
 
     let sheet_ix = resolve_sheet(&workbook, cli.sheet.as_deref())?;
 
-    #[cfg(feature = "debug")]
-    if cli.debug {
-        serde_json::to_writer_pretty(std::io::stdout(), &workbook.sheet(sheet_ix).inspect())?;
-        println!();
-        return Ok(());
-    }
-
     match cli.display {
         DisplayMode::Gui => {}
+        DisplayMode::Json => {
+            serde_json::to_writer_pretty(std::io::stdout(), &workbook.sheet(sheet_ix).inspect())?;
+            println!();
+            return Ok(());
+        }
         DisplayMode::Xml => {
             print!("{}", workbook.sheet(sheet_ix).to_pretty_xml());
             println!();
@@ -121,11 +119,6 @@ struct Cli {
     #[arg(long, value_enum, default_value_t = DisplayMode::Gui)]
     display: DisplayMode,
 
-    /// Print internal debug JSON and exit.
-    #[cfg(feature = "debug")]
-    #[arg(long)]
-    debug: bool,
-
     /// Spreadsheet file to open.
     path: PathBuf,
 }
@@ -134,31 +127,20 @@ struct Cli {
 enum DisplayMode {
     #[default]
     Gui,
+    Json,
     Xml,
     Table,
     Audit,
 }
 
 fn validate_output_mode(cli: &Cli) -> Result<()> {
-    let output_modes = usize::from(cli.list_sheets)
-        + usize::from(cli.display != DisplayMode::Gui)
-        + debug_output_mode_count(cli);
+    let output_modes = usize::from(cli.list_sheets) + usize::from(cli.display != DisplayMode::Gui);
 
     if output_modes > 1 {
-        bail!("choose only one output mode: --list-sheets, --display, or --debug");
+        bail!("choose only one output mode: --list-sheets or --display");
     }
 
     Ok(())
-}
-
-#[cfg(feature = "debug")]
-fn debug_output_mode_count(cli: &Cli) -> usize {
-    usize::from(cli.debug)
-}
-
-#[cfg(not(feature = "debug"))]
-fn debug_output_mode_count(_: &Cli) -> usize {
-    0
 }
 
 fn print_sheet_list(workbook: &workbook::WorkbookData) {
@@ -319,6 +301,12 @@ mod tests {
     }
 
     #[test]
+    fn parses_display_json_output_mode() {
+        let cli = parse_args(["spread", "--display", "json", "book.xlsx"]).unwrap();
+        assert_eq!(cli.display, DisplayMode::Json);
+    }
+
+    #[test]
     fn parses_audit_output_mode() {
         let cli = parse_args(["spread", "--display", "audit", "book.xlsx"]).unwrap();
         assert_eq!(cli.display, DisplayMode::Audit);
@@ -336,16 +324,8 @@ mod tests {
         assert!(error.to_string().contains("unexpected argument"));
     }
 
-    #[cfg(feature = "debug")]
     #[test]
-    fn parses_debug_output_mode() {
-        let cli = parse_args(["spread", "--debug", "book.xlsx"]).unwrap();
-        assert!(cli.debug);
-    }
-
-    #[cfg(not(feature = "debug"))]
-    #[test]
-    fn rejects_debug_without_feature() {
+    fn rejects_old_debug_flag() {
         let error = parse_args(["spread", "--debug", "book.xlsx"]).unwrap_err();
         assert!(error.to_string().contains("unexpected argument"));
     }

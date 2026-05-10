@@ -20,7 +20,7 @@ Unit tests live inline in the Rust modules under `#[cfg(test)]`.
 - `make check`: run `cargo clippy --all-targets -- -D warnings`.
 - `make test`: run all Rust unit tests.
 - `cargo run -- pydantic-by-numbers.xlsx`: open a workbook in the GPUI viewer.
-- `cargo run -- --json pydantic-by-numbers.xlsx`: print the Rust sheet inspection JSON.
+- `cargo run -- --display json pydantic-by-numbers.xlsx`: print the Rust sheet inspection JSON.
 - `uv run scripts/xlsx_inspect.py --json pydantic-by-numbers.xlsx`: print the openpyxl reference JSON.
 
 ## Coding Style & Naming Conventions

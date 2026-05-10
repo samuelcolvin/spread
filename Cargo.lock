@@ -5554,6 +5554,7 @@ dependencies = [
  "anyhow",
  "calamine",
  "clap",
+ "cocoa 0.26.0",
  "comfy-table",
  "csv",
  "formualizer-workbook",

@@ -4,10 +4,10 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
-    FontWeight, IntoElement, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, Stateful, Window, actions,
-    canvas, div, list, point, prelude::*, px, rgb,
+    AnyElement, App, Bounds, Context, Div, Entity, FocusHandle, Focusable, FontWeight, IntoElement,
+    ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollHandle, Stateful, Window, actions, canvas, div,
+    list, point, prelude::*, px, rgb,
 };
 
 use crate::workbook::{
@@ -160,7 +160,8 @@ impl SpreadsheetViewer {
 
     fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<'_, Self>) {
         let text = self.active_sheet().range_to_tsv(self.selection.range);
-        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        let html = self.active_sheet().range_to_html(self.selection.range);
+        write_rich_clipboard(&text, &html, cx);
     }
 
     fn switch_sheet(&mut self, sheet_ix: usize) -> bool {
@@ -1294,6 +1295,36 @@ fn formula_display_text(formula: &str) -> String {
     } else {
         format!("={formula}")
     }
+}
+
+#[cfg(target_os = "macos")]
+fn write_rich_clipboard(text: &str, html: &str, _: &mut Context<'_, SpreadsheetViewer>) {
+    use cocoa::{
+        appkit::{NSPasteboard, NSPasteboardTypeString},
+        base::nil,
+        foundation::NSString,
+    };
+
+    // Cocoa pasteboard calls are confined to the UI thread by GPUI action dispatch.
+    unsafe {
+        let pasteboard = NSPasteboard::generalPasteboard(nil);
+        pasteboard.clearContents();
+
+        let plain_text = NSString::alloc(nil).init_str(text);
+        pasteboard.setString_forType(plain_text, NSPasteboardTypeString);
+
+        let html_string = NSString::alloc(nil).init_str(html);
+        let public_html_type = NSString::alloc(nil).init_str("public.html");
+        pasteboard.setString_forType(html_string, public_html_type);
+
+        let text_html_type = NSString::alloc(nil).init_str("text/html");
+        pasteboard.setString_forType(html_string, text_html_type);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn write_rich_clipboard(text: &str, _: &str, cx: &mut Context<'_, SpreadsheetViewer>) {
+    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.to_owned()));
 }
 
 fn selection_outline(edges: SelectionEdgeSides) -> AnyElement {
