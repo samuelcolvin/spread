@@ -27,11 +27,15 @@ const CELL_TEXT: u32 = 0x20_21_24;
 const TITLE_BAR_BG: u32 = 0xf3_f4_f7;
 const FORMULA_FALLBACK_TEXT: u32 = 0x5f_63_68;
 const SELECTED_CELL_BG: u32 = 0xe8_f0_fe;
+const ACTIVE_TAB_BG: u32 = 0xff_ff_ff;
+const HOVER_CELL_BG: u32 = 0xee_f2_f7;
 const ACTIVE_CELL_BG: u32 = 0xd2_e3_fc;
 const SELECTION_BORDER: u32 = 0x1a_73_e8;
 const SELECTION_INNER_BORDER: u32 = 0xa8_c7_fa;
 const TITLE_BAR_HEIGHT: f32 = 40.0;
 const FORMULA_BAR_HEIGHT: f32 = 36.0;
+const FORMULA_BAR_LINE_HEIGHT: f32 = 17.0;
+const FORMULA_BAR_VERTICAL_PADDING: f32 = 12.0;
 const FOOTER_HEIGHT: f32 = 32.0;
 const RESIZE_HANDLE_SIZE: f32 = 6.0;
 const MIN_COLUMN_WIDTH: f32 = 24.0;
@@ -52,6 +56,7 @@ pub(crate) struct SpreadsheetViewer {
     summary_metric: SummaryMetric,
     show_summary_menu: bool,
     horizontal_scroll: ScrollHandle,
+    tabs_scroll: ScrollHandle,
     body_list: ListState,
     scrollbar_drag: Option<ScrollbarDrag>,
     resize_drag: Option<ResizeDrag>,
@@ -265,6 +270,7 @@ impl SpreadsheetViewer {
             summary_metric: SummaryMetric::Sum,
             show_summary_menu: false,
             horizontal_scroll: ScrollHandle::new(),
+            tabs_scroll: ScrollHandle::new(),
             body_list,
             scrollbar_drag: None,
             resize_drag: None,
@@ -1132,13 +1138,17 @@ fn formula_bar(sheet: &SheetData, selection: Selection) -> Div {
         .as_ref()
         .map(|formula| formula_display_text(formula))
         .unwrap_or(cell.value);
+    let multiline = formula_value.contains('\n');
+    let height = formula_bar_height(&formula_value);
+    let field_height = (height - FORMULA_BAR_VERTICAL_PADDING).max(24.0);
 
     div()
-        .h(px(FORMULA_BAR_HEIGHT))
+        .h(px(height))
         .flex_none()
         .flex()
-        .items_center()
+        .items_start()
         .gap_2()
+        .py_1()
         .px_2()
         .bg(rgb(HEADER_BG))
         .border_b_1()
@@ -1147,6 +1157,7 @@ fn formula_bar(sheet: &SheetData, selection: Selection) -> Div {
             div()
                 .w(px(72.0))
                 .h(px(24.0))
+                .mt(px(1.0))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1159,17 +1170,30 @@ fn formula_bar(sheet: &SheetData, selection: Selection) -> Div {
         .child(
             div()
                 .flex_1()
-                .h(px(24.0))
+                .h(px(field_height))
                 .flex()
-                .items_center()
+                .items_start()
                 .px_2()
                 .overflow_hidden()
-                .whitespace_nowrap()
                 .bg(rgb(CELL_BG))
                 .border_1()
                 .border_color(rgb(GRID_COLOR))
+                .when(!multiline, |element| {
+                    element.items_center().whitespace_nowrap()
+                })
+                .when(multiline, Styled::whitespace_normal)
                 .child(formula_value),
         )
+}
+
+fn formula_bar_height(value: &str) -> f32 {
+    let line_count = value.split('\n').count().max(1);
+    if line_count <= 1 {
+        FORMULA_BAR_HEIGHT
+    } else {
+        (line_count as f32 * FORMULA_BAR_LINE_HEIGHT + FORMULA_BAR_VERTICAL_PADDING)
+            .max(FORMULA_BAR_HEIGHT)
+    }
 }
 
 fn footer(viewer: &SpreadsheetViewer, cx: &mut Context<'_, SpreadsheetViewer>) -> Div {
@@ -1187,15 +1211,16 @@ fn footer(viewer: &SpreadsheetViewer, cx: &mut Context<'_, SpreadsheetViewer>) -
         .child(summary_box(viewer, &entity))
 }
 
-fn sheet_tabs(viewer: &SpreadsheetViewer, entity: &Entity<SpreadsheetViewer>) -> Div {
+fn sheet_tabs(viewer: &SpreadsheetViewer, entity: &Entity<SpreadsheetViewer>) -> Stateful<Div> {
     let mut tabs = div()
+        .id("sheet-tabs")
         .flex()
         .items_center()
-        .gap_1()
         .flex_1()
         .h_full()
-        .overflow_hidden()
-        .px_1();
+        .overflow_x_scroll()
+        .track_scroll(&viewer.tabs_scroll)
+        .scrollbar_width(px(0.0));
 
     for sheet_ix in 0..viewer.workbook.sheet_count() {
         let selected = sheet_ix == viewer.active_sheet;
@@ -1204,23 +1229,29 @@ fn sheet_tabs(viewer: &SpreadsheetViewer, entity: &Entity<SpreadsheetViewer>) ->
         tabs = tabs.child(
             div()
                 .id(("sheet-tab", sheet_ix))
-                .h(px(26.0))
+                .h_full()
                 .min_w(px(72.0))
-                .max_w(px(180.0))
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
                 .px_2()
-                .overflow_hidden()
                 .whitespace_nowrap()
-                .bg(rgb(if selected { CELL_BG } else { HEADER_BG }))
-                .border_1()
-                .border_color(rgb(if selected {
+                .cursor_pointer()
+                .bg(rgb(if selected { ACTIVE_TAB_BG } else { HEADER_BG }))
+                .text_color(rgb(if selected {
                     SELECTION_BORDER
                 } else {
-                    GRID_COLOR
+                    HEADER_TEXT
                 }))
-                .text_color(rgb(if selected { CELL_TEXT } else { HEADER_TEXT }))
+                .when(selected, |tab| {
+                    tab.border_l_1().border_r_1().border_color(rgb(GRID_COLOR))
+                })
+                .when(!selected, |tab| {
+                    tab.border_r_1()
+                        .border_color(rgb(GRID_COLOR))
+                        .hover(|tab| tab.bg(rgb(HOVER_CELL_BG)))
+                })
                 .child(label)
                 .on_mouse_down(MouseButton::Left, move |_, _, cx| {
                     tab_entity.update(cx, |viewer, cx| {
@@ -1405,7 +1436,8 @@ fn corner_header(entity: Entity<SpreadsheetViewer>) -> Div {
         .h(px(HEADER_HEIGHT))
         .flex_none()
         .bg(rgb(HEADER_BG))
-        .border_1()
+        .border_r_1()
+        .border_b_1()
         .border_color(rgb(GRID_COLOR))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             entity.update(cx, |viewer, cx| {
@@ -1465,13 +1497,9 @@ fn column_header(
         } else {
             HEADER_BG
         }))
-        .border_1()
-        .border_l_0()
-        .border_color(rgb(if selected {
-            SELECTION_BORDER
-        } else {
-            GRID_COLOR
-        }))
+        .border_r_1()
+        .border_b_1()
+        .border_color(rgb(GRID_COLOR))
         .text_color(rgb(HEADER_TEXT))
         .child(label)
         .child(
@@ -1537,13 +1565,9 @@ fn row_header(
         } else {
             HEADER_BG
         }))
-        .border_1()
-        .border_t_0()
-        .border_color(rgb(if selected {
-            SELECTION_BORDER
-        } else {
-            GRID_COLOR
-        }))
+        .border_r_1()
+        .border_b_1()
+        .border_color(rgb(GRID_COLOR))
         .text_color(rgb(HEADER_TEXT))
         .child((row_ix + 1).to_string())
         .child(
@@ -1834,6 +1858,12 @@ mod tests {
             cell_display_text(&cached_formula_cell),
             ("18".to_owned(), false)
         );
+    }
+
+    #[test]
+    fn formula_bar_expands_for_multiline_values() {
+        assert_float_eq(formula_bar_height("one line"), FORMULA_BAR_HEIGHT);
+        assert!(formula_bar_height("line 1\nline 2\nline 3") > FORMULA_BAR_HEIGHT);
     }
 
     #[test]
