@@ -4,9 +4,10 @@ use std::{
 };
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Div, Entity, FontWeight, IntoElement, ListAlignment,
-    ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, ScrollHandle, Stateful, Window, canvas, div, list, point, prelude::*, px, rgb,
+    AnyElement, App, Bounds, ClipboardItem, Context, Div, Entity, FocusHandle, Focusable,
+    FontWeight, IntoElement, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, ScrollHandle, Stateful, Window, actions,
+    canvas, div, list, point, prelude::*, px, rgb,
 };
 
 use crate::workbook::{
@@ -23,6 +24,7 @@ const HEADER_TEXT: u32 = 0x3c_40_43;
 const SHEET_BG: u32 = 0xfa_fa_fa;
 const CELL_BG: u32 = 0xff_ff_ff;
 const CELL_TEXT: u32 = 0x20_21_24;
+const FORMULA_FALLBACK_TEXT: u32 = 0x5f_63_68;
 const SELECTED_CELL_BG: u32 = 0xe8_f0_fe;
 const ACTIVE_CELL_BG: u32 = 0xd2_e3_fc;
 const SELECTION_BORDER: u32 = 0x1a_73_e8;
@@ -34,8 +36,11 @@ const VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL: Duration = Duration::from_millis(50)
 pub(crate) const WINDOW_WIDTH: f32 = 1100.0;
 pub(crate) const WINDOW_HEIGHT: f32 = 720.0;
 
+actions!(spreadsheet_viewer, [CopySelection]);
+
 pub(crate) struct SpreadsheetViewer {
     workbook: Arc<WorkbookData>,
+    focus_handle: FocusHandle,
     active_sheet: usize,
     selection: Selection,
     selection_drag: Option<CellCoord>,
@@ -121,12 +126,24 @@ enum ScrollbarDrag {
 }
 
 impl SpreadsheetViewer {
-    pub(crate) fn new(workbook: Arc<WorkbookData>) -> Self {
-        let body_list = ListState::new(workbook.row_count(), ListAlignment::Top, px(800.0));
+    pub(crate) fn new(
+        workbook: Arc<WorkbookData>,
+        active_sheet: usize,
+        window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) -> Self {
+        let body_list = ListState::new(
+            workbook.sheet(active_sheet).row_count(),
+            ListAlignment::Top,
+            px(800.0),
+        );
+        let focus_handle = cx.focus_handle();
+        focus_handle.focus(window);
 
         Self {
             workbook,
-            active_sheet: 0,
+            focus_handle,
+            active_sheet,
             selection: Selection::single(CellCoord::new(0, 0)),
             selection_drag: None,
             summary_metric: SummaryMetric::Sum,
@@ -139,6 +156,11 @@ impl SpreadsheetViewer {
 
     fn active_sheet(&self) -> &SheetData {
         self.workbook.sheet(self.active_sheet)
+    }
+
+    fn copy_selection(&mut self, _: &CopySelection, _: &mut Window, cx: &mut Context<'_, Self>) {
+        let text = self.active_sheet().range_to_tsv(self.selection.range);
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     fn switch_sheet(&mut self, sheet_ix: usize) -> bool {
@@ -243,22 +265,35 @@ impl SpreadsheetViewer {
     }
 }
 
+impl Focusable for SpreadsheetViewer {
+    fn focus_handle(&self, _: &App) -> FocusHandle {
+        self.focus_handle.clone()
+    }
+}
+
 impl Render for SpreadsheetViewer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let workbook = Arc::clone(&self.workbook);
         let sheet_ix = self.active_sheet;
         let selection = self.selection;
         let entity = cx.entity();
+        let focus_handle = self.focus_handle.clone();
 
         div()
             .id("spreadsheet-viewport")
             .size_full()
+            .key_context("SpreadsheetViewer")
+            .track_focus(&self.focus_handle(cx))
+            .on_action(cx.listener(Self::copy_selection))
             .bg(rgb(SHEET_BG))
             .text_color(rgb(CELL_TEXT))
             .text_size(px(12.0))
             .font_family("Arial")
             .flex()
             .flex_col()
+            .on_mouse_down(MouseButton::Left, move |_, window, _| {
+                focus_handle.focus(window);
+            })
             .on_mouse_up(MouseButton::Left, move |_, _, cx| {
                 entity.update(cx, |viewer, _| {
                     viewer.selection_drag = None;
@@ -774,13 +809,7 @@ fn formula_bar(sheet: &SheetData, selection: Selection) -> Div {
     let formula_value = cell
         .formula
         .as_ref()
-        .map(|formula| {
-            if formula.starts_with('=') {
-                formula.clone()
-            } else {
-                format!("={formula}")
-            }
-        })
+        .map(|formula| formula_display_text(formula))
         .unwrap_or(cell.value);
 
     div()
@@ -1031,7 +1060,7 @@ fn render_cells_row(
 
     for col_ix in 0..sheet.col_count() {
         row = row.child(cell(
-            sheet.cell_data(row_ix, col_ix),
+            &sheet.cell_data(row_ix, col_ix),
             sheet.column_width(col_ix),
             row_height,
             CellRenderState {
@@ -1169,7 +1198,7 @@ fn row_header(
 }
 
 fn cell(
-    cell: CellData,
+    cell: &CellData,
     width: f32,
     row_height: f32,
     state: CellRenderState,
@@ -1177,6 +1206,12 @@ fn cell(
 ) -> Div {
     let entity: Entity<SpreadsheetViewer> = (*entity).clone();
     let highlighted = state.active || state.selected;
+    let (cell_text, formula_fallback) = cell_display_text(cell);
+    let text_color = if formula_fallback {
+        FORMULA_FALLBACK_TEXT
+    } else {
+        cell.style.text_color.unwrap_or(CELL_TEXT)
+    };
     let border_color = if state.selected {
         SELECTION_INNER_BORDER
     } else {
@@ -1201,7 +1236,7 @@ fn cell(
         } else {
             cell.style.background_color.unwrap_or(CELL_BG)
         }))
-        .text_color(rgb(cell.style.text_color.unwrap_or(CELL_TEXT)));
+        .text_color(rgb(text_color));
 
     element = element.border_l_0().border_t_0();
 
@@ -1210,7 +1245,7 @@ fn cell(
     }
 
     let drag_entity = entity.clone();
-    let mut element = element.child(cell.value);
+    let mut element = element.child(cell_text);
 
     if highlighted {
         element = element.child(selection_outline(state.selection_edges));
@@ -1235,6 +1270,30 @@ fn cell(
                 }
             });
         })
+}
+
+fn cell_display_text(cell: &CellData) -> (String, bool) {
+    let Some(formula) = cell
+        .formula
+        .as_deref()
+        .filter(|formula| !formula.is_empty())
+    else {
+        return (cell.value.clone(), false);
+    };
+
+    if cell.value.is_empty() {
+        (formula_display_text(formula), true)
+    } else {
+        (cell.value.clone(), false)
+    }
+}
+
+fn formula_display_text(formula: &str) -> String {
+    if formula.starts_with('=') {
+        formula.to_owned()
+    } else {
+        format!("={formula}")
+    }
 }
 
 fn selection_outline(edges: SelectionEdgeSides) -> AnyElement {
@@ -1331,5 +1390,28 @@ mod tests {
         assert_eq!(column_name(27), "AB");
         assert_eq!(column_name(701), "ZZ");
         assert_eq!(column_name(702), "AAA");
+    }
+
+    #[test]
+    fn blank_cached_formula_displays_formula_fallback() {
+        let formula_cell = CellData {
+            value: String::new(),
+            formula: Some("'Engineering'!B7".to_owned()),
+            ..Default::default()
+        };
+        let cached_formula_cell = CellData {
+            value: "18".to_owned(),
+            formula: Some("'Engineering'!B7".to_owned()),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            cell_display_text(&formula_cell),
+            ("='Engineering'!B7".to_owned(), true)
+        );
+        assert_eq!(
+            cell_display_text(&cached_formula_cell),
+            ("18".to_owned(), false)
+        );
     }
 }

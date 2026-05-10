@@ -23,3 +23,14 @@ or:
 ```sh
 spread path/to/file.csv
 ```
+
+Useful CLI modes:
+
+```sh
+spread --list-sheets path/to/file.xlsx
+spread --sheet Summary path/to/file.xlsx
+spread --sheet 2 --display xml path/to/file.xlsx
+spread --sheet 2 --display table path/to/file.xlsx
+```
+
+`--sheet` accepts a sheet name or 1-based sheet index. `--display` can be `gui`, `xml`, or `table`.

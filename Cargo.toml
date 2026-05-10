@@ -3,14 +3,21 @@ name = "spread"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+debug = ["serde", "serde_json"]
+
 [dependencies]
 anyhow = "1.0"
 calamine = "0.34"
+clap = { version = "4.6", features = ["derive"] }
+comfy-table = "7.2.2"
 csv = "1.4"
+formualizer-workbook = "0.5.2"
 gpui = "0.2.2"
 quick-xml = "0.39"
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde = { version = "1.0", features = ["derive"], optional = true }
+serde_json = { version = "1.0", optional = true }
 zip = "7.2"
 
 [lints.clippy]
