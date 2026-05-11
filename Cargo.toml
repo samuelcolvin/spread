@@ -2,6 +2,10 @@
 name = "spread"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
+authors = ["Samuel Colvin <samuel@pydantic.dev>"]
+description = "Spreadsheet and table viewer"
+homepage = "https://github.com/samuelcolvin/spread"
 
 [dependencies]
 anyhow = "1.0"

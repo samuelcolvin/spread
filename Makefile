@@ -5,15 +5,20 @@
 	@cargo --version || echo 'Please install cargo: https://github.com/rust-lang/cargo'
 
 .PHONY: install
-install: .cargo ## Install the spread binary from this checkout
+install: .cargo ## Install dependencies and set up pre-commit hooks
+	cargo build
+	uvx prek install --install-hooks
+
+.PHONY: install-pkg
+install-pkg: .cargo ## Install the spread binary from this checkout
 	cargo install --path . --locked
 
 .PHONY: format
 format: .cargo ## Format Rust code with rustfmt
 	cargo fmt --all
 
-.PHONY: check
-check: .cargo ## Check Rust code with clippy
+.PHONY: lint
+lint: .cargo ## Check Rust code with clippy
 	cargo clippy --all-targets -- -D warnings
 
 .PHONY: test
