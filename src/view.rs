@@ -14,7 +14,9 @@ use gpui::{
 
 use crate::{
     CloseFile,
-    workbook::{CellCoord, CellData, CellRange, SelectionEdgeSides, SheetData, WorkbookData},
+    workbook::{
+        CellCoord, CellData, CellRange, SelectionEdgeSides, SheetData, SheetRowLayout, WorkbookData,
+    },
 };
 
 const ROW_HEADER_WIDTH: f32 = 48.0;
@@ -144,9 +146,20 @@ enum ScrollbarDrag {
 #[derive(Clone)]
 struct SheetLayout {
     column_widths: Vec<f32>,
-    row_heights: Vec<f32>,
-    row_offsets: Vec<f32>,
+    rows: RowLayout,
     sheet_width: f32,
+}
+
+#[derive(Clone)]
+enum RowLayout {
+    Uniform {
+        row_count: usize,
+        height: f32,
+    },
+    Explicit {
+        row_heights: Vec<f32>,
+        row_offsets: Vec<f32>,
+    },
 }
 
 impl SheetLayout {
@@ -154,16 +167,12 @@ impl SheetLayout {
         let column_widths = (0..sheet.col_count())
             .map(|col_ix| sheet.column_width(col_ix))
             .collect::<Vec<_>>();
-        let row_heights = (0..sheet.row_count())
-            .map(|row_ix| sheet.row_height(row_ix))
-            .collect::<Vec<_>>();
-        let row_offsets = row_offsets_for_heights(&row_heights);
+        let rows = RowLayout::new(sheet.row_layout());
         let sheet_width = column_widths.iter().sum();
 
         Self {
             column_widths,
-            row_heights,
-            row_offsets,
+            rows,
             sheet_width,
         }
     }
@@ -176,28 +185,20 @@ impl SheetLayout {
     }
 
     fn row_height(&self, row: usize) -> f32 {
-        self.row_heights.get(row).copied().unwrap_or(MIN_ROW_HEIGHT)
+        self.rows.row_height(row)
     }
 
     fn sheet_height(&self) -> f32 {
-        self.row_offsets.last().copied().unwrap_or(0.0)
+        self.rows.sheet_height()
     }
 
     fn scroll_position_for_row_offset(&self, row_ix: usize, offset_in_row: f32) -> f32 {
-        self.row_offsets.get(row_ix).copied().unwrap_or(0.0) + offset_in_row
+        self.rows
+            .scroll_position_for_row_offset(row_ix, offset_in_row)
     }
 
     fn row_offset_for_scroll_position(&self, position: f32) -> (usize, f32) {
-        if self.row_heights.is_empty() {
-            return (0, 0.0);
-        }
-
-        let row_ix = self
-            .row_offsets
-            .partition_point(|offset| *offset <= position);
-        let row_ix = row_ix.saturating_sub(1).min(self.row_heights.len() - 1);
-        let row_start = self.row_offsets.get(row_ix).copied().unwrap_or(0.0);
-        (row_ix, (position - row_start).max(0.0))
+        self.rows.row_offset_for_scroll_position(position)
     }
 
     fn set_column_widths(&mut self, updates: &[(usize, f32)]) {
@@ -210,13 +211,141 @@ impl SheetLayout {
     }
 
     fn set_row_heights(&mut self, updates: &[(usize, f32)]) {
-        for (row_ix, height) in updates {
-            if let Some(row_height) = self.row_heights.get_mut(*row_ix) {
-                *row_height = height.max(MIN_ROW_HEIGHT);
+        self.rows.set_row_heights(updates);
+    }
+}
+
+impl RowLayout {
+    fn new(layout: SheetRowLayout) -> Self {
+        match layout {
+            SheetRowLayout::Uniform { row_count, height } => Self::Uniform {
+                row_count,
+                height: height.max(MIN_ROW_HEIGHT),
+            },
+            SheetRowLayout::Explicit { heights } => Self::from_explicit_heights(heights),
+        }
+    }
+
+    fn from_explicit_heights(row_heights: Vec<f32>) -> Self {
+        let row_heights = row_heights
+            .into_iter()
+            .map(|height| height.max(MIN_ROW_HEIGHT))
+            .collect::<Vec<_>>();
+        let row_offsets = row_offsets_for_heights(&row_heights);
+        Self::Explicit {
+            row_heights,
+            row_offsets,
+        }
+    }
+
+    fn row_height(&self, row: usize) -> f32 {
+        match self {
+            Self::Uniform { row_count, height } => {
+                if row < *row_count {
+                    *height
+                } else {
+                    MIN_ROW_HEIGHT
+                }
+            }
+            Self::Explicit { row_heights, .. } => {
+                row_heights.get(row).copied().unwrap_or(MIN_ROW_HEIGHT)
             }
         }
-        self.row_offsets = row_offsets_for_heights(&self.row_heights);
     }
+
+    fn sheet_height(&self) -> f32 {
+        match self {
+            Self::Uniform { row_count, height } => *row_count as f32 * *height,
+            Self::Explicit { row_offsets, .. } => row_offsets.last().copied().unwrap_or(0.0),
+        }
+    }
+
+    fn scroll_position_for_row_offset(&self, row_ix: usize, offset_in_row: f32) -> f32 {
+        match self {
+            Self::Uniform { row_count, height } => {
+                if *row_count == 0 {
+                    0.0
+                } else {
+                    row_ix.min(row_count - 1) as f32 * *height + offset_in_row
+                }
+            }
+            Self::Explicit { row_offsets, .. } => {
+                row_offsets.get(row_ix).copied().unwrap_or(0.0) + offset_in_row
+            }
+        }
+    }
+
+    fn row_offset_for_scroll_position(&self, position: f32) -> (usize, f32) {
+        match self {
+            Self::Uniform { row_count, height } => {
+                if *row_count == 0 || *height <= 0.0 {
+                    return (0, 0.0);
+                }
+
+                let row_ix = uniform_row_index_for_position(position, *height);
+                let row_ix = row_ix.min(row_count - 1);
+                let row_start = row_ix as f32 * *height;
+                (row_ix, (position - row_start).max(0.0))
+            }
+            Self::Explicit {
+                row_heights,
+                row_offsets,
+            } => {
+                if row_heights.is_empty() {
+                    return (0, 0.0);
+                }
+
+                let row_ix = row_offsets.partition_point(|offset| *offset <= position);
+                let row_ix = row_ix.saturating_sub(1).min(row_heights.len() - 1);
+                let row_start = row_offsets.get(row_ix).copied().unwrap_or(0.0);
+                (row_ix, (position - row_start).max(0.0))
+            }
+        }
+    }
+
+    fn set_row_heights(&mut self, updates: &[(usize, f32)]) {
+        match self {
+            Self::Uniform { row_count, height } => {
+                if updates.is_empty() {
+                    return;
+                }
+
+                let first_height = updates[0].1.max(MIN_ROW_HEIGHT);
+                if updates.len() == *row_count
+                    && updates.iter().all(|(_, update_height)| {
+                        (update_height.max(MIN_ROW_HEIGHT) - first_height).abs() < f32::EPSILON
+                    })
+                {
+                    *height = first_height;
+                    return;
+                }
+
+                let mut row_heights = vec![*height; *row_count];
+                for (row_ix, update_height) in updates {
+                    if let Some(row_height) = row_heights.get_mut(*row_ix) {
+                        *row_height = update_height.max(MIN_ROW_HEIGHT);
+                    }
+                }
+                *self = Self::from_explicit_heights(row_heights);
+            }
+            Self::Explicit {
+                row_heights,
+                row_offsets,
+            } => {
+                for (row_ix, height) in updates {
+                    if let Some(row_height) = row_heights.get_mut(*row_ix) {
+                        *row_height = height.max(MIN_ROW_HEIGHT);
+                    }
+                }
+                *row_offsets = row_offsets_for_heights(row_heights);
+            }
+        }
+    }
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn uniform_row_index_for_position(position: f32, row_height: f32) -> usize {
+    (position.max(0.0) / row_height).floor() as usize
 }
 
 fn row_offsets_for_heights(row_heights: &[f32]) -> Vec<f32> {
@@ -1885,8 +2014,7 @@ mod tests {
     fn sheet_layout_resizes_columns_and_rows_with_minimums() {
         let mut layout = SheetLayout {
             column_widths: vec![100.0, 120.0],
-            row_heights: vec![24.0, 30.0],
-            row_offsets: row_offsets_for_heights(&[24.0, 30.0]),
+            rows: RowLayout::from_explicit_heights(vec![24.0, 30.0]),
             sheet_width: 220.0,
         };
 
@@ -1903,6 +2031,28 @@ mod tests {
         assert_eq!(row_ix, 1);
         assert_float_eq(offset, 1.0);
         assert_float_eq(layout.scroll_position_for_row_offset(1, 3.0), 43.0);
+    }
+
+    #[test]
+    fn uniform_row_layout_maps_scroll_positions_without_offsets() {
+        let mut layout = SheetLayout {
+            column_widths: vec![100.0],
+            rows: RowLayout::new(SheetRowLayout::Uniform {
+                row_count: 1_000_000,
+                height: 24.0,
+            }),
+            sheet_width: 100.0,
+        };
+
+        assert_float_eq(layout.row_height(999_999), 24.0);
+        assert_float_eq(layout.sheet_height(), 24_000_000.0);
+        assert_eq!(layout.row_offset_for_scroll_position(48.5), (2, 0.5));
+        assert_float_eq(layout.scroll_position_for_row_offset(3, 4.0), 76.0);
+
+        layout.set_row_heights(&[(0, 30.0), (1, 30.0), (2, 30.0)]);
+
+        assert_float_eq(layout.row_height(0), 30.0);
+        assert_float_eq(layout.row_height(3), 24.0);
     }
 
     fn assert_float_eq(left: f32, right: f32) {

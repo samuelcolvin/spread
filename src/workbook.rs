@@ -1,9 +1,11 @@
 use std::{
+    any::Any,
     collections::HashMap,
     fmt::Write as _,
     fs::File,
     io::Read,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -22,6 +24,11 @@ pub(crate) struct WorkbookData {
 #[derive(Debug, Clone)]
 pub(crate) struct SheetData {
     name: String,
+    source: Arc<dyn SheetSource>,
+}
+
+#[derive(Debug, Clone)]
+struct EagerSheetSource {
     rows: Vec<Vec<CellData>>,
     column_widths: Vec<f32>,
     row_heights: Vec<f32>,
@@ -29,6 +36,24 @@ pub(crate) struct SheetData {
     default_row_height: f32,
     row_count: usize,
     col_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum SheetRowLayout {
+    Uniform { row_count: usize, height: f32 },
+    Explicit { heights: Vec<f32> },
+}
+
+trait SheetSource: Any + Send + Sync + std::fmt::Debug {
+    fn as_any_mut(&mut self) -> &mut dyn Any;
+    fn row_count(&self) -> usize;
+    fn col_count(&self) -> usize;
+    fn cell_data(&self, row: usize, col: usize) -> CellData;
+    fn column_width(&self, col: usize) -> f32;
+    fn row_height(&self, row: usize) -> f32;
+    fn row_layout(&self) -> SheetRowLayout;
+    fn is_fully_loaded(&self) -> bool;
+    fn supports_full_range_operations(&self) -> bool;
 }
 
 impl WorkbookData {
@@ -79,7 +104,7 @@ impl WorkbookData {
     }
 
     #[cfg(test)]
-    pub(crate) fn cell(&self, row: usize, col: usize) -> &str {
+    pub(crate) fn cell(&self, row: usize, col: usize) -> String {
         self.sheet(0).cell(row, col)
     }
 
@@ -136,8 +161,8 @@ impl WorkbookData {
             ..Default::default()
         };
 
-        for row_ix in 0..sheet.row_count {
-            for col_ix in 0..sheet.col_count {
+        for row_ix in 0..sheet.row_count() {
+            for col_ix in 0..sheet.col_count() {
                 let cell = sheet.cell_data(row_ix, col_ix);
                 let Some(formula) = cell
                     .formula
@@ -190,19 +215,146 @@ impl SheetData {
         default_column_width: f32,
         default_row_height: f32,
     ) -> Self {
-        let row_count = rows.len();
-        let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
-        let row_heights = display_row_heights(
-            &rows,
+        Self::new_with_row_mode(
+            sheet_name,
+            rows,
+            column_widths,
             row_heights,
-            &column_widths,
             default_column_width,
             default_row_height,
-            row_count,
+            EagerRowHeightMode::Auto,
+        )
+    }
+
+    fn new_uniform_rows(
+        sheet_name: Option<String>,
+        rows: Vec<Vec<CellData>>,
+        column_widths: Vec<f32>,
+        default_column_width: f32,
+        default_row_height: f32,
+    ) -> Self {
+        Self::new_with_row_mode(
+            sheet_name,
+            rows,
+            column_widths,
+            Vec::new(),
+            default_column_width,
+            default_row_height,
+            EagerRowHeightMode::Uniform,
+        )
+    }
+
+    fn new_with_row_mode(
+        sheet_name: Option<String>,
+        rows: Vec<Vec<CellData>>,
+        column_widths: Vec<f32>,
+        row_heights: Vec<f32>,
+        default_column_width: f32,
+        default_row_height: f32,
+        row_height_mode: EagerRowHeightMode,
+    ) -> Self {
+        let name = sheet_name.unwrap_or_else(|| "Sheet1".to_owned());
+        let source = EagerSheetSource::new(
+            rows,
+            column_widths,
+            row_heights,
+            default_column_width,
+            default_row_height,
+            row_height_mode,
         );
 
         Self {
-            name: sheet_name.unwrap_or_else(|| "Sheet1".to_owned()),
+            name,
+            source: Arc::new(source),
+        }
+    }
+
+    fn eager_source_mut(&mut self) -> Option<&mut EagerSheetSource> {
+        Arc::get_mut(&mut self.source)?
+            .as_any_mut()
+            .downcast_mut::<EagerSheetSource>()
+    }
+
+    pub(crate) fn row_layout(&self) -> SheetRowLayout {
+        self.source.row_layout()
+    }
+
+    pub(crate) fn is_fully_loaded(&self) -> bool {
+        self.source.is_fully_loaded()
+    }
+
+    pub(crate) fn supports_full_range_operations(&self) -> bool {
+        self.source.supports_full_range_operations()
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn row_count(&self) -> usize {
+        self.source.row_count()
+    }
+
+    pub(crate) fn col_count(&self) -> usize {
+        self.source.col_count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn cell(&self, row: usize, col: usize) -> String {
+        self.cell_data(row, col).value
+    }
+
+    pub(crate) fn cell_data(&self, row: usize, col: usize) -> CellData {
+        self.source.cell_data(row, col)
+    }
+
+    pub(crate) fn column_width(&self, col: usize) -> f32 {
+        self.source.column_width(col)
+    }
+
+    pub(crate) fn row_height(&self, row: usize) -> f32 {
+        self.source.row_height(row)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sheet_height(&self) -> f32 {
+        match self.row_layout() {
+            SheetRowLayout::Uniform { row_count, height } => row_count as f32 * height,
+            SheetRowLayout::Explicit { heights } => heights.into_iter().sum(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum EagerRowHeightMode {
+    Auto,
+    Uniform,
+}
+
+impl EagerSheetSource {
+    fn new(
+        rows: Vec<Vec<CellData>>,
+        column_widths: Vec<f32>,
+        row_heights: Vec<f32>,
+        default_column_width: f32,
+        default_row_height: f32,
+        row_height_mode: EagerRowHeightMode,
+    ) -> Self {
+        let row_count = rows.len();
+        let col_count = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let row_heights = match row_height_mode {
+            EagerRowHeightMode::Auto => display_row_heights(
+                &rows,
+                row_heights,
+                &column_widths,
+                default_column_width,
+                default_row_height,
+                row_count,
+            ),
+            EagerRowHeightMode::Uniform => Vec::new(),
+        };
+
+        Self {
             rows,
             column_widths,
             row_heights,
@@ -212,28 +364,22 @@ impl SheetData {
             col_count,
         }
     }
+}
 
-    pub(crate) fn name(&self) -> &str {
-        &self.name
+impl SheetSource for EagerSheetSource {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 
-    pub(crate) fn row_count(&self) -> usize {
+    fn row_count(&self) -> usize {
         self.row_count
     }
 
-    pub(crate) fn col_count(&self) -> usize {
+    fn col_count(&self) -> usize {
         self.col_count
     }
 
-    #[cfg(test)]
-    pub(crate) fn cell(&self, row: usize, col: usize) -> &str {
-        self.rows
-            .get(row)
-            .and_then(|columns| columns.get(col))
-            .map_or("", |cell| cell.value.as_str())
-    }
-
-    pub(crate) fn cell_data(&self, row: usize, col: usize) -> CellData {
+    fn cell_data(&self, row: usize, col: usize) -> CellData {
         self.rows
             .get(row)
             .and_then(|columns| columns.get(col))
@@ -241,7 +387,7 @@ impl SheetData {
             .unwrap_or_default()
     }
 
-    pub(crate) fn column_width(&self, col: usize) -> f32 {
+    fn column_width(&self, col: usize) -> f32 {
         self.column_widths
             .get(col)
             .copied()
@@ -249,7 +395,7 @@ impl SheetData {
             .unwrap_or(self.default_column_width)
     }
 
-    pub(crate) fn row_height(&self, row: usize) -> f32 {
+    fn row_height(&self, row: usize) -> f32 {
         self.row_heights
             .get(row)
             .copied()
@@ -257,28 +403,57 @@ impl SheetData {
             .unwrap_or(self.default_row_height)
     }
 
-    #[cfg(test)]
-    pub(crate) fn sheet_height(&self) -> f32 {
-        (0..self.row_count)
-            .map(|row_ix| self.row_height(row_ix))
-            .sum()
+    fn row_layout(&self) -> SheetRowLayout {
+        if self.row_heights.is_empty()
+            || self
+                .row_heights
+                .iter()
+                .all(|height| (*height - self.default_row_height).abs() < f32::EPSILON)
+        {
+            SheetRowLayout::Uniform {
+                row_count: self.row_count,
+                height: self.default_row_height,
+            }
+        } else {
+            SheetRowLayout::Explicit {
+                heights: (0..self.row_count)
+                    .map(|row_ix| self.row_height(row_ix))
+                    .collect(),
+            }
+        }
     }
 
+    fn is_fully_loaded(&self) -> bool {
+        true
+    }
+
+    fn supports_full_range_operations(&self) -> bool {
+        true
+    }
+}
+
+impl SheetData {
     fn has_missing_formula_values(&self) -> bool {
-        self.rows.iter().flatten().any(|cell| {
-            cell.value.is_empty()
-                && cell
-                    .formula
-                    .as_deref()
-                    .is_some_and(|formula| !formula.is_empty())
+        (0..self.row_count()).any(|row_ix| {
+            (0..self.col_count()).any(|col_ix| {
+                let cell = self.cell_data(row_ix, col_ix);
+                cell.value.is_empty()
+                    && cell
+                        .formula
+                        .as_deref()
+                        .is_some_and(|formula| !formula.is_empty())
+            })
         })
     }
 
     pub(crate) fn inspect(&self) -> InspectedSheet {
-        let mut cells = Vec::with_capacity(self.row_count * self.col_count);
+        debug_assert!(self.is_fully_loaded() || self.supports_full_range_operations());
+        let row_count = self.row_count();
+        let col_count = self.col_count();
+        let mut cells = Vec::with_capacity(row_count * col_count);
 
-        for row_ix in 0..self.row_count {
-            for col_ix in 0..self.col_count {
+        for row_ix in 0..row_count {
+            for col_ix in 0..col_count {
                 let cell = self.cell_data(row_ix, col_ix);
                 cells.push(InspectedCell {
                     x: column_name(col_ix),
@@ -295,13 +470,14 @@ impl SheetData {
 
         InspectedSheet {
             sheet: self.name.clone(),
-            rows: self.row_count,
-            cols: self.col_count,
+            rows: row_count,
+            cols: col_count,
             cells,
         }
     }
 
     pub(crate) fn summary_for_range(&self, range: CellRange) -> SelectionSummary {
+        debug_assert!(self.supports_full_range_operations());
         let mut summary = SelectionSummary {
             selected_cells: range.cell_count(),
             ..Default::default()
@@ -323,6 +499,7 @@ impl SheetData {
     }
 
     pub(crate) fn range_to_tsv(&self, range: CellRange) -> String {
+        debug_assert!(self.supports_full_range_operations());
         let range = range.normalized();
         let mut output = String::new();
 
@@ -344,6 +521,7 @@ impl SheetData {
     }
 
     pub(crate) fn range_to_html(&self, range: CellRange) -> String {
+        debug_assert!(self.supports_full_range_operations());
         let range = range.normalized();
         let mut output = String::new();
         output.push_str(
@@ -382,18 +560,19 @@ impl SheetData {
     }
 
     pub(crate) fn to_pretty_xml(&self) -> String {
+        debug_assert!(self.supports_full_range_operations());
         let mut output = String::new();
         output.push_str("<sheet name=\"");
         append_xml_attr(&mut output, &self.name);
         output.push_str("\">\n");
 
-        for row_ix in 0..self.row_count {
+        for row_ix in 0..self.row_count() {
             let row_tag = format!("row_{}", row_ix + 1);
             output.push_str("  <");
             output.push_str(&row_tag);
             output.push_str(">\n");
 
-            for col_ix in 0..self.col_count {
+            for col_ix in 0..self.col_count() {
                 let cell = self.cell_data(row_ix, col_ix);
                 let col_tag = column_name(col_ix).to_ascii_lowercase();
 
@@ -425,13 +604,10 @@ impl SheetData {
     }
 
     fn numeric_value(&self, row: usize, col: usize) -> Option<f64> {
-        self.rows
-            .get(row)
-            .and_then(|columns| columns.get(col))
-            .and_then(|cell| match cell.raw_value {
-                CellRawValue::Number(value) => Some(value),
-                _ => None,
-            })
+        match self.cell_data(row, col).raw_value {
+            CellRawValue::Number(value) => Some(value),
+            _ => None,
+        }
     }
 }
 
@@ -847,10 +1023,9 @@ fn load_csv(path: &Path) -> Result<WorkbookData> {
 
     Ok(WorkbookData::new(
         path.to_owned(),
-        vec![SheetData::new(
+        vec![SheetData::new_uniform_rows(
             None,
             rows,
-            Vec::new(),
             Vec::new(),
             DEFAULT_COLUMN_WIDTH,
             DEFAULT_ROW_HEIGHT,
@@ -942,9 +1117,14 @@ fn calculate_missing_formula_values(sheets: &mut [SheetData]) {
     }
 
     for sheet in sheets {
-        for row_ix in 0..sheet.row_count {
-            for col_ix in 0..sheet.col_count {
-                let Some(cell) = sheet
+        let sheet_name = sheet.name.clone();
+        let Some(source) = sheet.eager_source_mut() else {
+            continue;
+        };
+
+        for row_ix in 0..source.row_count {
+            for col_ix in 0..source.col_count {
+                let Some(cell) = source
                     .rows
                     .get_mut(row_ix)
                     .and_then(|columns| columns.get_mut(col_ix))
@@ -959,7 +1139,7 @@ fn calculate_missing_formula_values(sheets: &mut [SheetData]) {
                 let (Some(row), Some(col)) = (coord_u32(row_ix), coord_u32(col_ix)) else {
                     continue;
                 };
-                let Ok(value) = workbook.evaluate_cell(&sheet.name, row, col) else {
+                let Ok(value) = workbook.evaluate_cell(&sheet_name, row, col) else {
                     continue;
                 };
                 let Some((display_value, raw_value)) =
@@ -992,8 +1172,8 @@ fn build_formula_workbook(
     }
 
     for sheet in sheets {
-        for row_ix in 0..sheet.row_count {
-            for col_ix in 0..sheet.col_count {
+        for row_ix in 0..sheet.row_count() {
+            for col_ix in 0..sheet.col_count() {
                 let cell = sheet.cell_data(row_ix, col_ix);
                 if let Some(formula) = cell
                     .formula
@@ -1797,6 +1977,22 @@ mod tests {
     }
 
     #[test]
+    fn csv_uses_uniform_row_layout() {
+        let path = temp_file("spread-layout.csv");
+        fs::write(&path, "name,note\nAda,\"line 1\nline 2\"\n").unwrap();
+
+        let workbook = load_csv(&path).unwrap();
+
+        assert!(matches!(
+            workbook.sheet(0).row_layout(),
+            SheetRowLayout::Uniform { row_count: 2, height }
+                if (height - DEFAULT_ROW_HEIGHT).abs() < f32::EPSILON
+        ));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn multiline_cells_expand_auto_row_height_without_overriding_explicit_height() {
         let sheet = SheetData::new(
             Some("Sheet1".to_owned()),
@@ -1811,6 +2007,10 @@ mod tests {
         );
 
         assert!(sheet.row_height(0) > DEFAULT_ROW_HEIGHT);
+        assert!(matches!(
+            sheet.row_layout(),
+            SheetRowLayout::Explicit { heights } if heights[0] > DEFAULT_ROW_HEIGHT
+        ));
 
         let sheet = SheetData::new(
             Some("Sheet1".to_owned()),
