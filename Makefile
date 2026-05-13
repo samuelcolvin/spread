@@ -1,5 +1,10 @@
 .DEFAULT_GOAL := help
 
+APP_NAME ?= Spread
+APP_DIR ?= $(HOME)/Applications/$(APP_NAME).app
+BUNDLE_ID ?= com.samuelcolvin.spread
+LSREGISTER ?= /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+
 .PHONY: .cargo
 .cargo: ## Check that cargo is installed
 	@cargo --version || echo 'Please install cargo: https://github.com/rust-lang/cargo'
@@ -9,17 +14,30 @@ install: .cargo ## Install dependencies and set up pre-commit hooks
 	cargo build
 	uvx prek install --install-hooks
 
-.PHONY: install-pkg
-install-pkg: .cargo ## Install the spread binary from this checkout
+.PHONY: install-app
+install-app: .cargo macos-app ## Install the spread CLI and macOS app bundle
 	cargo install --path . --locked
+
+.PHONY: macos-app
+macos-app: .cargo ## Build and install Spread.app for Finder integration
+	cargo build --release --locked
+	install -d "$(APP_DIR)/Contents/MacOS" "$(APP_DIR)/Contents/Resources"
+	install -m 755 target/release/spread "$(APP_DIR)/Contents/MacOS/spread"
+	install -m 644 packaging/macos/Info.plist "$(APP_DIR)/Contents/Info.plist"
+	@echo "Installed $(APP_DIR)"
+	@echo "Registering Spread.app with macOS Launch Services"
+	"$(LSREGISTER)" -f "$(APP_DIR)"
 
 .PHONY: format
 format: .cargo ## Format Rust code with rustfmt
 	cargo fmt --all
 
-.PHONY: lint
-lint: .cargo ## Check Rust code with clippy
+.PHONY: check
+check: .cargo ## Check Rust code with clippy
 	cargo clippy --all-targets -- -D warnings
+
+.PHONY: lint
+lint: check ## Alias for make check
 
 .PHONY: test
 test: .cargo ## Run Rust unit tests

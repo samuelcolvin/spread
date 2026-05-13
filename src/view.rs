@@ -1,4 +1,6 @@
 use std::{
+    cell::Cell,
+    rc::Rc,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -10,8 +12,9 @@ use gpui::{
     list, point, prelude::*, px, rgb,
 };
 
-use crate::workbook::{
-    CellCoord, CellData, CellRange, SelectionEdgeSides, SheetData, WorkbookData,
+use crate::{
+    CloseFile,
+    workbook::{CellCoord, CellData, CellRange, SelectionEdgeSides, SheetData, WorkbookData},
 };
 
 const ROW_HEADER_WIDTH: f32 = 48.0;
@@ -49,6 +52,7 @@ actions!(spreadsheet_viewer, [CopySelection]);
 
 pub(crate) struct SpreadsheetViewer {
     workbook: Arc<WorkbookData>,
+    show_splash_after_close: Rc<Cell<bool>>,
     focus_handle: FocusHandle,
     active_sheet: usize,
     selection: Selection,
@@ -246,6 +250,7 @@ impl SpreadsheetViewer {
     pub(crate) fn new(
         workbook: Arc<WorkbookData>,
         active_sheet: usize,
+        show_splash_after_close: Rc<Cell<bool>>,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -263,6 +268,7 @@ impl SpreadsheetViewer {
 
         Self {
             workbook,
+            show_splash_after_close,
             focus_handle,
             active_sheet,
             selection: Selection::single(CellCoord::new(0, 0)),
@@ -294,6 +300,14 @@ impl SpreadsheetViewer {
         let text = self.active_sheet().range_to_tsv(self.selection.range);
         let html = self.active_sheet().range_to_html(self.selection.range);
         write_rich_clipboard(&text, &html, cx);
+    }
+
+    fn close_file(&mut self, _: &CloseFile, window: &mut Window, _: &mut Context<'_, Self>) {
+        // Handle Close File inside the document window, not as a global app action.
+        // GPUI menu actions are dispatched through the active window first; removing
+        // this exact window here avoids guessing which app window should be closed.
+        self.show_splash_after_close.set(true);
+        window.remove_window();
     }
 
     fn switch_sheet(&mut self, sheet_ix: usize) -> bool {
@@ -558,6 +572,7 @@ impl Render for SpreadsheetViewer {
             .key_context("SpreadsheetViewer")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::close_file))
             .bg(rgb(SHEET_BG))
             .text_color(rgb(CELL_TEXT))
             .text_size(px(12.0))

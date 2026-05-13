@@ -9,8 +9,10 @@ It currently opens CSV and XLSX files for viewing only. Editing is intentionally
 Install the binary locally:
 
 ```sh
-make install
+make install-app
 ```
+
+On macOS, this also installs `Spread.app` to `~/Applications`, registers it with Finder, and sets it as the default app for `.xlsx` and `.csv` when [`duti`](https://github.com/moretension/duti) is installed. Without `duti`, use Finder's Get Info panel to choose Spread and click "Change All...".
 
 Then open a file with:
 

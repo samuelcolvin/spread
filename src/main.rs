@@ -1,11 +1,17 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use gpui::{
-    App, Application, Bounds, KeyBinding, TitlebarOptions, WindowBounds, WindowOptions, point,
-    prelude::*, px, size,
+    App, Application, AsyncApp, Bounds, Context, Div, FontWeight, IntoElement, KeyBinding, Menu,
+    MenuItem, MouseButton, PathPromptOptions, Render, SystemMenuType, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, div, point, prelude::*, px, rgb, size,
 };
 
 use crate::{
@@ -15,6 +21,19 @@ use crate::{
 
 mod view;
 mod workbook;
+
+actions!(spread_app, [OpenDocument, CloseFile, QuitSpread]);
+
+const APP_NAME: &str = "Spread";
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const SPLASH_WIDTH: f32 = 520.0;
+const SPLASH_HEIGHT: f32 = 360.0;
+const SPLASH_BG: u32 = 0xf8_f9_fa;
+const SPLASH_TEXT: u32 = 0x20_21_24;
+const SPLASH_MUTED_TEXT: u32 = 0x5f_63_68;
+const SPLASH_BUTTON_BG: u32 = 0x1a_73_e8;
+const SPLASH_BUTTON_HOVER_BG: u32 = 0x18_64_c9;
+const SPLASH_BUTTON_TEXT: u32 = 0xff_ff_ff;
 
 fn main() {
     let cli = Cli::parse();
@@ -27,32 +46,37 @@ fn main() {
 fn run(cli: &Cli) -> Result<()> {
     validate_output_mode(cli)?;
 
-    let workbook = Arc::new(load_workbook(&cli.path)?);
-
     if cli.list_sheets {
+        let workbook = Arc::new(load_workbook(required_path(cli)?)?);
         print_sheet_list(&workbook);
         return Ok(());
     }
 
-    let sheet_ix = resolve_sheet(&workbook, cli.sheet.as_deref())?;
-
     match cli.display {
         DisplayMode::Gui => {}
         DisplayMode::Json => {
+            let workbook = Arc::new(load_workbook(required_path(cli)?)?);
+            let sheet_ix = resolve_sheet(&workbook, cli.sheet.as_deref())?;
             serde_json::to_writer_pretty(std::io::stdout(), &workbook.sheet(sheet_ix).inspect())?;
             println!();
             return Ok(());
         }
         DisplayMode::Xml => {
+            let workbook = Arc::new(load_workbook(required_path(cli)?)?);
+            let sheet_ix = resolve_sheet(&workbook, cli.sheet.as_deref())?;
             print!("{}", workbook.sheet(sheet_ix).to_pretty_xml());
             println!();
             return Ok(());
         }
         DisplayMode::Table => {
+            let workbook = Arc::new(load_workbook(required_path(cli)?)?);
+            let sheet_ix = resolve_sheet(&workbook, cli.sheet.as_deref())?;
             print_terminal_table(workbook.sheet(sheet_ix));
             return Ok(());
         }
         DisplayMode::Audit => {
+            let workbook = Arc::new(load_workbook(required_path(cli)?)?);
+            let sheet_ix = resolve_sheet(&workbook, cli.sheet.as_deref())?;
             let audits = workbook.formula_audits(cli.sheet.as_ref().map(|_| sheet_ix))?;
             print_formula_audits(&audits);
             let exit_code = formula_audit_exit_code(&audits);
@@ -63,46 +87,367 @@ fn run(cli: &Cli) -> Result<()> {
         }
     }
 
-    let title = format!("spread - {}", workbook.display_name());
+    let initial_path = cli.path.clone();
+    let initial_sheet = cli.sheet.clone();
+    let async_app: Rc<RefCell<Option<AsyncApp>>> = Rc::new(RefCell::new(None));
+    let pending_urls = Rc::new(RefCell::new(Vec::new()));
+    // Set by a document window just before it closes itself via File > Close File.
+    // The app shell consumes it in on_window_closed so opening the splash happens
+    // after GPUI has actually removed the document window from its window list.
+    let show_splash_after_document_close = Rc::new(Cell::new(false));
+    let open_urls_app = Rc::clone(&async_app);
+    let open_urls_pending = Rc::clone(&pending_urls);
+    let open_urls_show_splash_after_document_close = Rc::clone(&show_splash_after_document_close);
+    let application = Application::new();
 
-    Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+    application.on_open_urls(move |urls| {
+        let Some(async_app) = open_urls_app.borrow().as_ref().cloned() else {
+            open_urls_pending.borrow_mut().extend(urls);
+            return;
+        };
+        let executor = async_app.foreground_executor().clone();
+        let show_splash_after_document_close =
+            Rc::clone(&open_urls_show_splash_after_document_close);
+        executor
+            .spawn(async move {
+                if let Err(error) =
+                    async_app.update(|cx| open_urls(urls, &show_splash_after_document_close, cx))
+                {
+                    eprintln!("{error:#}");
+                }
+            })
+            .detach();
+    });
+
+    application.run(move |cx: &mut App| {
+        *async_app.borrow_mut() = Some(cx.to_async());
+        let pending_urls = pending_urls.borrow_mut().drain(..).collect::<Vec<_>>();
+        let opened_pending_urls = if pending_urls.is_empty() {
+            0
+        } else {
+            open_urls(pending_urls, &show_splash_after_document_close, cx)
+        };
+        let should_open_splash = initial_path.is_none() && opened_pending_urls == 0;
+
+        if should_open_splash
+            && let Err(error) = open_splash_window(cx, Rc::clone(&show_splash_after_document_close))
+        {
+            eprintln!("{error:#}");
+            cx.quit();
+            return;
+        }
+
         cx.bind_keys([KeyBinding::new(
             "cmd-c",
             CopySelection,
             Some("SpreadsheetViewer"),
         )]);
+        cx.bind_keys([KeyBinding::new("cmd-o", OpenDocument, None)]);
+        cx.bind_keys([KeyBinding::new("cmd-q", CloseFile, None)]);
+        let open_dialog_show_splash_after_document_close =
+            Rc::clone(&show_splash_after_document_close);
+        cx.on_action(move |_: &OpenDocument, cx| {
+            open_document_from_dialog(Rc::clone(&open_dialog_show_splash_after_document_close), cx);
+        });
+        cx.on_action(quit_spread);
+        cx.set_menus(vec![
+            Menu {
+                name: "Spread".into(),
+                items: vec![
+                    MenuItem::os_submenu("Services", SystemMenuType::Services),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Spread", QuitSpread),
+                ],
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("Open...", OpenDocument),
+                    MenuItem::separator(),
+                    MenuItem::action("Close File", CloseFile),
+                ],
+            },
+        ]);
 
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
+        let closed_window_show_splash_after_document_close =
+            Rc::clone(&show_splash_after_document_close);
+        cx.on_window_closed(move |cx| {
+            if closed_window_show_splash_after_document_close.replace(false) {
+                // Close File removes the document window first. Only after GPUI has
+                // reported that close do we create the splash window, otherwise the
+                // app can briefly have zero windows and quit or leave stale windows.
+                if document_window_count(cx) == 0
+                    && !has_splash_window(cx)
+                    && let Err(error) = open_splash_window(
+                        cx,
+                        Rc::clone(&closed_window_show_splash_after_document_close),
+                    )
+                {
+                    eprintln!("{error:#}");
+                }
+            } else if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
 
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    title: Some(title.clone().into()),
-                    appears_transparent: true,
-                    traffic_light_position: Some(point(px(16.0), px(13.0))),
-                }),
-                ..Default::default()
-            },
-            {
-                let workbook = Arc::clone(&workbook);
-                move |window, cx| {
-                    cx.new(|cx| SpreadsheetViewer::new(Arc::clone(&workbook), sheet_ix, window, cx))
-                }
-            },
-        )
-        .unwrap_or_else(|error| panic!("failed to open window for {title}: {error}"));
+        if let Some(path) = initial_path.as_ref()
+            && let Err(error) = open_workbook_window(
+                path,
+                initial_sheet.as_deref(),
+                Rc::clone(&show_splash_after_document_close),
+                cx,
+            )
+        {
+            eprintln!("{error:#}");
+            cx.quit();
+        }
 
         cx.activate(true);
     });
 
     Ok(())
+}
+
+fn open_document_from_dialog(show_splash_after_document_close: Rc<Cell<bool>>, cx: &mut App) {
+    let paths = cx.prompt_for_paths(PathPromptOptions {
+        files: true,
+        directories: false,
+        multiple: false,
+        prompt: Some("Open file".into()),
+    });
+
+    cx.spawn(async move |cx| match paths.await {
+        Ok(Ok(Some(paths))) => {
+            if let Err(error) = cx.update(|cx| {
+                open_paths(paths, &show_splash_after_document_close, cx);
+            }) {
+                eprintln!("{error:#}");
+            }
+        }
+        Ok(Ok(None)) => {}
+        Ok(Err(error)) => eprintln!("{error:#}"),
+        Err(error) => eprintln!("failed to receive selected file paths: {error}"),
+    })
+    .detach();
+}
+
+fn quit_spread(_: &QuitSpread, cx: &mut App) {
+    cx.quit();
+}
+
+fn open_paths(
+    paths: Vec<PathBuf>,
+    show_splash_after_document_close: &Rc<Cell<bool>>,
+    cx: &mut App,
+) -> usize {
+    let mut opened = 0;
+    for path in paths {
+        if let Err(error) =
+            open_workbook_window(&path, None, Rc::clone(show_splash_after_document_close), cx)
+        {
+            eprintln!("{error:#}");
+        } else {
+            opened += 1;
+        }
+    }
+    if opened > 0 {
+        close_splash_windows(cx);
+    }
+    opened
+}
+
+fn open_urls(
+    urls: Vec<String>,
+    show_splash_after_document_close: &Rc<Cell<bool>>,
+    cx: &mut App,
+) -> usize {
+    open_paths(
+        urls.into_iter()
+            .filter_map(|url| {
+                let path = file_url_to_path(&url);
+                if path.is_none() {
+                    eprintln!("unsupported URL from platform: {url}");
+                }
+                path
+            })
+            .collect(),
+        show_splash_after_document_close,
+        cx,
+    )
+}
+
+fn open_workbook_window(
+    path: &Path,
+    sheet: Option<&str>,
+    show_splash_after_document_close: Rc<Cell<bool>>,
+    cx: &mut App,
+) -> Result<()> {
+    let workbook = Arc::new(load_workbook(path)?);
+    let sheet_ix = resolve_sheet(&workbook, sheet)?;
+    let title = format!("spread - {}", workbook.display_name());
+    let bounds = Bounds::centered(None, size(px(WINDOW_WIDTH), px(WINDOW_HEIGHT)), cx);
+
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(title.clone().into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(16.0), px(13.0))),
+            }),
+            ..Default::default()
+        },
+        {
+            let workbook = Arc::clone(&workbook);
+            move |window, cx| {
+                cx.new(|cx| {
+                    SpreadsheetViewer::new(
+                        Arc::clone(&workbook),
+                        sheet_ix,
+                        Rc::clone(&show_splash_after_document_close),
+                        window,
+                        cx,
+                    )
+                })
+            }
+        },
+    )
+    .with_context(|| format!("failed to open window for {title}"))?;
+
+    cx.activate(true);
+    Ok(())
+}
+
+fn open_splash_window(
+    cx: &mut App,
+    show_splash_after_document_close: Rc<Cell<bool>>,
+) -> Result<()> {
+    let bounds = Bounds::centered(None, size(px(SPLASH_WIDTH), px(SPLASH_HEIGHT)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some(APP_NAME.into()),
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(16.0), px(13.0))),
+            }),
+            ..Default::default()
+        },
+        |_, cx| {
+            cx.new(|_| SplashScreen {
+                show_splash_after_document_close,
+            })
+        },
+    )
+    .context("failed to open splash window")?;
+
+    cx.activate(true);
+    Ok(())
+}
+
+fn close_splash_windows(cx: &mut App) {
+    for window_handle in cx.windows() {
+        if window_handle.downcast::<SplashScreen>().is_none() {
+            continue;
+        }
+        let _ = window_handle.update(cx, |_, window, _| window.remove_window());
+    }
+}
+
+fn document_window_count(cx: &App) -> usize {
+    cx.windows()
+        .into_iter()
+        .filter(|window| window.downcast::<SpreadsheetViewer>().is_some())
+        .count()
+}
+
+fn has_splash_window(cx: &App) -> bool {
+    cx.windows()
+        .into_iter()
+        .any(|window| window.downcast::<SplashScreen>().is_some())
+}
+
+struct SplashScreen {
+    show_splash_after_document_close: Rc<Cell<bool>>,
+}
+
+impl Render for SplashScreen {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        let show_splash_after_document_close = Rc::clone(&self.show_splash_after_document_close);
+
+        div()
+            .id("splash-screen")
+            .size_full()
+            .on_action(cx.listener(
+                |view: &mut SplashScreen, _: &OpenDocument, _: &mut Window, cx| {
+                    open_document_from_dialog(
+                        Rc::clone(&view.show_splash_after_document_close),
+                        cx,
+                    );
+                },
+            ))
+            .bg(rgb(SPLASH_BG))
+            .text_color(rgb(SPLASH_TEXT))
+            .font_family("Arial")
+            .flex()
+            .flex_col()
+            .child(splash_title_bar())
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_4()
+                    .px(px(32.0))
+                    .pb(px(32.0))
+                    .child(
+                        div()
+                            .text_size(px(34.0))
+                            .font_weight(FontWeight::BOLD)
+                            .child(APP_NAME),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(SPLASH_MUTED_TEXT))
+                            .child(format!("Version {APP_VERSION}")),
+                    )
+                    .child(open_button(show_splash_after_document_close)),
+            )
+    }
+}
+
+fn splash_title_bar() -> Div {
+    div()
+        .h(px(44.0))
+        .w_full()
+        .flex_none()
+        .on_mouse_down(MouseButton::Left, |_, window, _| {
+            window.start_window_move();
+        })
+}
+
+fn open_button(show_splash_after_document_close: Rc<Cell<bool>>) -> Div {
+    div()
+        .mt(px(12.0))
+        .px(px(20.0))
+        .h(px(34.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(SPLASH_BUTTON_BG))
+        .text_color(rgb(SPLASH_BUTTON_TEXT))
+        .text_size(px(13.0))
+        .font_weight(FontWeight::BOLD)
+        .cursor_pointer()
+        .hover(|button| button.bg(rgb(SPLASH_BUTTON_HOVER_BG)))
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            open_document_from_dialog(Rc::clone(&show_splash_after_document_close), cx);
+        })
+        .child("Open file")
 }
 
 #[derive(Debug, Parser, PartialEq, Eq)]
@@ -121,7 +466,7 @@ struct Cli {
     display: DisplayMode,
 
     /// Spreadsheet file to open.
-    path: PathBuf,
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -141,7 +486,55 @@ fn validate_output_mode(cli: &Cli) -> Result<()> {
         bail!("choose only one output mode: --list-sheets or --display");
     }
 
+    if cli.path.is_none()
+        && (cli.display != DisplayMode::Gui || cli.list_sheets || cli.sheet.is_some())
+    {
+        bail!("missing spreadsheet file path");
+    }
+
     Ok(())
+}
+
+fn required_path(cli: &Cli) -> Result<&Path> {
+    cli.path
+        .as_deref()
+        .ok_or_else(|| anyhow!("missing spreadsheet file path"))
+}
+
+fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    let path = url
+        .strip_prefix("file://localhost/")
+        .or_else(|| url.strip_prefix("file:///"))?;
+    Some(PathBuf::from(format!("/{}", percent_decode(path)?)))
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::with_capacity(bytes.len());
+    let mut ix = 0;
+
+    while ix < bytes.len() {
+        if bytes[ix] == b'%' {
+            let hi = *bytes.get(ix + 1)?;
+            let lo = *bytes.get(ix + 2)?;
+            output.push((hex_value(hi)? << 4) | hex_value(lo)?);
+            ix += 3;
+        } else {
+            output.push(bytes[ix]);
+            ix += 1;
+        }
+    }
+
+    String::from_utf8(output).ok()
+}
+
+fn hex_value(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        b'A'..=b'F' => Some(value - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn print_sheet_list(workbook: &workbook::WorkbookData) {
@@ -273,7 +666,7 @@ mod tests {
     #[test]
     fn parses_cli_path() {
         let cli = parse_args(["spread", "book.csv"]).unwrap();
-        assert_eq!(cli.path, PathBuf::from("book.csv"));
+        assert_eq!(cli.path.as_deref(), Some(Path::new("book.csv")));
         assert_eq!(cli.sheet, None);
         assert!(!cli.list_sheets);
         assert_eq!(cli.display, DisplayMode::Gui);
@@ -290,7 +683,7 @@ mod tests {
             "book.xlsx",
         ])
         .unwrap();
-        assert_eq!(cli.path, PathBuf::from("book.xlsx"));
+        assert_eq!(cli.path.as_deref(), Some(Path::new("book.xlsx")));
         assert_eq!(cli.sheet.as_deref(), Some("Summary"));
         assert_eq!(cli.display, DisplayMode::Xml);
     }
@@ -332,9 +725,37 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_cli_path() {
-        let error = parse_args(["spread"]).unwrap_err();
-        assert!(error.to_string().contains("required"));
+    fn allows_gui_without_path() {
+        let cli = parse_args(["spread"]).unwrap();
+        validate_output_mode(&cli).unwrap();
+        assert_eq!(cli.display, DisplayMode::Gui);
+        assert_eq!(cli.path, None);
+    }
+
+    #[test]
+    fn rejects_missing_cli_path_for_output_modes() {
+        let cli = parse_args(["spread", "--display", "table"]).unwrap();
+        let error = validate_output_mode(&cli).unwrap_err();
+        assert!(error.to_string().contains("missing spreadsheet file path"));
+    }
+
+    #[test]
+    fn rejects_missing_cli_path_with_sheet() {
+        let cli = parse_args(["spread", "--sheet", "Summary"]).unwrap();
+        let error = validate_output_mode(&cli).unwrap_err();
+        assert!(error.to_string().contains("missing spreadsheet file path"));
+    }
+
+    #[test]
+    fn converts_file_urls_to_paths() {
+        assert_eq!(
+            file_url_to_path("file:///Users/samuel/My%20File.xlsx").as_deref(),
+            Some(Path::new("/Users/samuel/My File.xlsx"))
+        );
+        assert_eq!(
+            file_url_to_path("file://localhost/Users/samuel/book.csv").as_deref(),
+            Some(Path::new("/Users/samuel/book.csv"))
+        );
     }
 
     #[test]
