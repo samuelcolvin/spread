@@ -28,7 +28,7 @@ trap 'rm -rf "$tmp_dir"' EXIT
 iconset_dir="$tmp_dir/Spread.iconset"
 splash_svg="$tmp_dir/SpreadSplash.svg"
 mkdir -p "$iconset_dir" "$(dirname "$output_icns")"
-sed 's/<rect width="256" height="256" rx="32" fill="#fff"\/>/<rect width="256" height="256" rx="32" fill="none"\/>/' "$source_svg" > "$splash_svg"
+sed 's/<rect x="22" y="22" width="212" height="212" rx="26.5" fill="#fff"\/>/<rect x="22" y="22" width="212" height="212" rx="26.5" fill="none"\/>/' "$source_svg" > "$splash_svg"
 
 render_icon() {
   local logical_size="$1"
