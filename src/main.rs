@@ -32,6 +32,7 @@ const SPLASH_HEIGHT: f32 = 360.0;
 const SPLASH_BG: u32 = 0xf8_f9_fa;
 const SPLASH_TEXT: u32 = 0x20_21_24;
 const SPLASH_MUTED_TEXT: u32 = 0x5f_63_68;
+const SPLASH_ERROR_TEXT: u32 = 0xb3_26_1e;
 const SPLASH_BUTTON_BG: u32 = 0x1a_73_e8;
 const SPLASH_BUTTON_HOVER_BG: u32 = 0x18_64_c9;
 const SPLASH_BUTTON_TEXT: u32 = 0xff_ff_ff;
@@ -100,6 +101,7 @@ fn run(cli: &Cli) -> Result<()> {
     let initial_sheet = cli.sheet.clone();
     let async_app: Rc<RefCell<Option<AsyncApp>>> = Rc::new(RefCell::new(None));
     let pending_urls = Rc::new(RefCell::new(Vec::new()));
+    let splash_error = Rc::new(RefCell::new(None));
     // Set by a document window just before it closes itself via File > Close File.
     // The app shell consumes it in on_window_closed so opening the splash happens
     // after GPUI has actually removed the document window from its window list.
@@ -107,6 +109,7 @@ fn run(cli: &Cli) -> Result<()> {
     let open_urls_app = Rc::clone(&async_app);
     let open_urls_pending = Rc::clone(&pending_urls);
     let open_urls_show_splash_after_document_close = Rc::clone(&show_splash_after_document_close);
+    let open_urls_splash_error = Rc::clone(&splash_error);
     let application = Application::new();
 
     application.on_open_urls(move |urls| {
@@ -117,11 +120,12 @@ fn run(cli: &Cli) -> Result<()> {
         let executor = async_app.foreground_executor().clone();
         let show_splash_after_document_close =
             Rc::clone(&open_urls_show_splash_after_document_close);
+        let splash_error = Rc::clone(&open_urls_splash_error);
         executor
             .spawn(async move {
-                if let Err(error) =
-                    async_app.update(|cx| open_urls(urls, &show_splash_after_document_close, cx))
-                {
+                if let Err(error) = async_app.update(|cx| {
+                    open_urls(urls, &show_splash_after_document_close, &splash_error, cx)
+                }) {
                     eprintln!("{error:#}");
                 }
             })
@@ -135,12 +139,21 @@ fn run(cli: &Cli) -> Result<()> {
         let opened_pending_urls = if pending_urls.is_empty() {
             0
         } else {
-            open_urls(pending_urls, &show_splash_after_document_close, cx)
+            open_urls(
+                pending_urls,
+                &show_splash_after_document_close,
+                &splash_error,
+                cx,
+            )
         };
         let should_open_splash = initial_path.is_none() && opened_pending_urls == 0;
 
         if should_open_splash
-            && let Err(error) = open_splash_window(cx, Rc::clone(&show_splash_after_document_close))
+            && let Err(error) = open_splash_window(
+                cx,
+                Rc::clone(&show_splash_after_document_close),
+                Rc::clone(&splash_error),
+            )
         {
             eprintln!("{error:#}");
             cx.quit();
@@ -156,8 +169,13 @@ fn run(cli: &Cli) -> Result<()> {
         cx.bind_keys([KeyBinding::new("cmd-q", CloseFile, None)]);
         let open_dialog_show_splash_after_document_close =
             Rc::clone(&show_splash_after_document_close);
+        let open_dialog_splash_error = Rc::clone(&splash_error);
         cx.on_action(move |_: &OpenDocument, cx| {
-            open_document_from_dialog(Rc::clone(&open_dialog_show_splash_after_document_close), cx);
+            open_document_from_dialog(
+                Rc::clone(&open_dialog_show_splash_after_document_close),
+                Rc::clone(&open_dialog_splash_error),
+                cx,
+            );
         });
         cx.on_action(quit_spread);
         cx.set_menus(vec![
@@ -191,6 +209,7 @@ fn run(cli: &Cli) -> Result<()> {
                     && let Err(error) = open_splash_window(
                         cx,
                         Rc::clone(&closed_window_show_splash_after_document_close),
+                        Rc::clone(&splash_error),
                     )
                 {
                     eprintln!("{error:#}");
@@ -246,7 +265,11 @@ fn set_app_icon() {
 #[cfg(not(target_os = "macos"))]
 fn set_app_icon() {}
 
-fn open_document_from_dialog(show_splash_after_document_close: Rc<Cell<bool>>, cx: &mut App) {
+fn open_document_from_dialog(
+    show_splash_after_document_close: Rc<Cell<bool>>,
+    splash_error: Rc<RefCell<Option<String>>>,
+    cx: &mut App,
+) {
     let paths = cx.prompt_for_paths(PathPromptOptions {
         files: true,
         directories: false,
@@ -257,7 +280,7 @@ fn open_document_from_dialog(show_splash_after_document_close: Rc<Cell<bool>>, c
     cx.spawn(async move |cx| match paths.await {
         Ok(Ok(Some(paths))) => {
             if let Err(error) = cx.update(|cx| {
-                open_paths(paths, &show_splash_after_document_close, cx);
+                open_paths(paths, &show_splash_after_document_close, &splash_error, cx);
             }) {
                 eprintln!("{error:#}");
             }
@@ -276,6 +299,7 @@ fn quit_spread(_: &QuitSpread, cx: &mut App) {
 fn open_paths(
     paths: Vec<PathBuf>,
     show_splash_after_document_close: &Rc<Cell<bool>>,
+    splash_error: &Rc<RefCell<Option<String>>>,
     cx: &mut App,
 ) -> usize {
     let mut opened = 0;
@@ -284,11 +308,14 @@ fn open_paths(
             open_workbook_window(&path, None, Rc::clone(show_splash_after_document_close), cx)
         {
             eprintln!("{error:#}");
+            *splash_error.borrow_mut() = Some(error.to_string());
+            notify_splash_windows(cx);
         } else {
             opened += 1;
         }
     }
     if opened > 0 {
+        splash_error.borrow_mut().take();
         close_splash_windows(cx);
     }
     opened
@@ -297,6 +324,7 @@ fn open_paths(
 fn open_urls(
     urls: Vec<String>,
     show_splash_after_document_close: &Rc<Cell<bool>>,
+    splash_error: &Rc<RefCell<Option<String>>>,
     cx: &mut App,
 ) -> usize {
     open_paths(
@@ -310,6 +338,7 @@ fn open_urls(
             })
             .collect(),
         show_splash_after_document_close,
+        splash_error,
         cx,
     )
 }
@@ -359,6 +388,7 @@ fn open_workbook_window(
 fn open_splash_window(
     cx: &mut App,
     show_splash_after_document_close: Rc<Cell<bool>>,
+    splash_error: Rc<RefCell<Option<String>>>,
 ) -> Result<()> {
     let bounds = Bounds::centered(None, size(px(SPLASH_WIDTH), px(SPLASH_HEIGHT)), cx);
     cx.open_window(
@@ -374,6 +404,7 @@ fn open_splash_window(
         |_, cx| {
             cx.new(|_| SplashScreen {
                 show_splash_after_document_close,
+                error: splash_error,
             })
         },
     )
@@ -392,6 +423,14 @@ fn close_splash_windows(cx: &mut App) {
     }
 }
 
+fn notify_splash_windows(cx: &mut App) {
+    for window_handle in cx.windows() {
+        if let Some(splash_window) = window_handle.downcast::<SplashScreen>() {
+            let _ = splash_window.update(cx, |_, _, cx| cx.notify());
+        }
+    }
+}
+
 fn document_window_count(cx: &App) -> usize {
     cx.windows()
         .into_iter()
@@ -407,11 +446,13 @@ fn has_splash_window(cx: &App) -> bool {
 
 struct SplashScreen {
     show_splash_after_document_close: Rc<Cell<bool>>,
+    error: Rc<RefCell<Option<String>>>,
 }
 
 impl Render for SplashScreen {
     fn render(&mut self, _: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let show_splash_after_document_close = Rc::clone(&self.show_splash_after_document_close);
+        let error = self.error.borrow().clone();
 
         div()
             .id("splash-screen")
@@ -420,6 +461,7 @@ impl Render for SplashScreen {
                 |view: &mut SplashScreen, _: &OpenDocument, _: &mut Window, cx| {
                     open_document_from_dialog(
                         Rc::clone(&view.show_splash_after_document_close),
+                        Rc::clone(&view.error),
                         cx,
                     );
                 },
@@ -458,7 +500,11 @@ impl Render for SplashScreen {
                             .text_color(rgb(SPLASH_MUTED_TEXT))
                             .child(format!("Version {APP_VERSION}")),
                     )
-                    .child(open_button(show_splash_after_document_close)),
+                    .child(open_button(
+                        show_splash_after_document_close,
+                        Rc::clone(&self.error),
+                    ))
+                    .child(error_line(error)),
             )
     }
 }
@@ -473,7 +519,10 @@ fn splash_title_bar() -> Div {
         })
 }
 
-fn open_button(show_splash_after_document_close: Rc<Cell<bool>>) -> Div {
+fn open_button(
+    show_splash_after_document_close: Rc<Cell<bool>>,
+    splash_error: Rc<RefCell<Option<String>>>,
+) -> Div {
     div()
         .mt(px(12.0))
         .px(px(20.0))
@@ -488,9 +537,22 @@ fn open_button(show_splash_after_document_close: Rc<Cell<bool>>) -> Div {
         .cursor_pointer()
         .hover(|button| button.bg(rgb(SPLASH_BUTTON_HOVER_BG)))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-            open_document_from_dialog(Rc::clone(&show_splash_after_document_close), cx);
+            open_document_from_dialog(
+                Rc::clone(&show_splash_after_document_close),
+                Rc::clone(&splash_error),
+                cx,
+            );
         })
         .child("Open file")
+}
+
+fn error_line(error: Option<String>) -> Div {
+    div()
+        .h(px(18.0))
+        .max_w(px(420.0))
+        .text_size(px(12.0))
+        .text_color(rgb(SPLASH_ERROR_TEXT))
+        .child(error.unwrap_or_default())
 }
 
 #[derive(Debug, Parser, PartialEq, Eq)]
