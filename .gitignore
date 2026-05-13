@@ -1,2 +1,4 @@
 *.xlsx
 target/
+/tmp/
+/scratch/

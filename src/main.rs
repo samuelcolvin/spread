@@ -2,16 +2,17 @@ use std::{
     cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::Rc,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use clap::{Parser, ValueEnum};
 use comfy_table::{ContentArrangement, Table, presets::UTF8_FULL};
 use gpui::{
-    App, Application, AsyncApp, Bounds, Context, Div, FontWeight, IntoElement, KeyBinding, Menu,
-    MenuItem, MouseButton, PathPromptOptions, Render, SystemMenuType, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, actions, div, point, prelude::*, px, rgb, size,
+    App, Application, AsyncApp, Bounds, Context, Div, FontWeight, Image, ImageFormat, IntoElement,
+    KeyBinding, Menu, MenuItem, MouseButton, PathPromptOptions, Render, SystemMenuType,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, img, point, prelude::*, px,
+    rgb, size,
 };
 
 use crate::{
@@ -34,6 +35,14 @@ const SPLASH_MUTED_TEXT: u32 = 0x5f_63_68;
 const SPLASH_BUTTON_BG: u32 = 0x1a_73_e8;
 const SPLASH_BUTTON_HOVER_BG: u32 = 0x18_64_c9;
 const SPLASH_BUTTON_TEXT: u32 = 0xff_ff_ff;
+#[cfg(target_os = "macos")]
+const APP_ICON_BYTES: &[u8] = include_bytes!("../packaging/macos/Spread.icns");
+static SPREAD_LOGO: LazyLock<Arc<Image>> = LazyLock::new(|| {
+    Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        include_bytes!("../packaging/macos/Spread.png").to_vec(),
+    ))
+});
 
 fn main() {
     let cli = Cli::parse();
@@ -120,6 +129,7 @@ fn run(cli: &Cli) -> Result<()> {
     });
 
     application.run(move |cx: &mut App| {
+        set_app_icon();
         *async_app.borrow_mut() = Some(cx.to_async());
         let pending_urls = pending_urls.borrow_mut().drain(..).collect::<Vec<_>>();
         let opened_pending_urls = if pending_urls.is_empty() {
@@ -208,6 +218,33 @@ fn run(cli: &Cli) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+fn set_app_icon() {
+    use cocoa::{
+        appkit::{NSApp, NSApplication, NSImage},
+        base::{id, nil},
+        foundation::NSData,
+    };
+    use std::ffi::c_void;
+
+    // GPUI also supports launching the CLI binary directly, so set the Dock icon
+    // from embedded data instead of relying only on the app bundle's Info.plist.
+    unsafe {
+        let data = NSData::dataWithBytes_length_(
+            nil,
+            APP_ICON_BYTES.as_ptr().cast::<c_void>(),
+            APP_ICON_BYTES.len() as _,
+        );
+        let image = cocoa::appkit::NSImage::initWithData_(NSImage::alloc(nil), data);
+        if image != nil {
+            NSApp().setApplicationIconImage_(image as id);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_app_icon() {}
 
 fn open_document_from_dialog(show_splash_after_document_close: Rc<Cell<bool>>, cx: &mut App) {
     let paths = cx.prompt_for_paths(PathPromptOptions {
@@ -400,9 +437,15 @@ impl Render for SplashScreen {
                     .flex_col()
                     .items_center()
                     .justify_center()
-                    .gap_4()
+                    .gap_3()
                     .px(px(32.0))
                     .pb(px(32.0))
+                    .child(
+                        img(Arc::clone(&SPREAD_LOGO))
+                            .w(px(96.0))
+                            .h(px(96.0))
+                            .flex_none(),
+                    )
                     .child(
                         div()
                             .text_size(px(34.0))

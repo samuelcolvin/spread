@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="-18 -18 292 292" role="img" aria-labelledby="title desc">
+  <title id="title">Spread logo</title>
+  <desc id="desc">A black spreadsheet tile with a white S on a pale blue sheet background.</desc>
+  <rect width="256" height="256" rx="32" fill="#fff"/>
+  <path
+    fill="#bfdbfe"
+    d="M116 48h112c12 0 22 10 22 22v116c0 12-10 22-22 22H116V48z"
+  />
+  <path
+    fill="#000"
+    d="M12 45c0-8 6-15 14-16L137 8c11-2 21 6 21 17v206c0 11-10 19-21 17L26 227c-8-1-14-8-14-16V45z"
+  />
+  <path
+    fill="#fff"
+    d="M84 177c-20 0-35-9-43-23-3-5-1-12 5-15 5-3 12-1 15 4 4 8 12 13 23 13 13 0 22-6 22-15 0-8-5-12-24-16-24-5-38-16-38-37 0-22 18-38 44-38 18 0 32 7 40 20 3 5 2 12-3 15s-12 2-15-3c-4-7-11-11-22-11-13 0-21 7-21 16 0 8 6 12 25 16 25 5 38 16 38 37 0 23-18 37-46 37z"
+  />
+</svg>
