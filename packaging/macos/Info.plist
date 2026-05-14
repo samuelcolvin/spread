@@ -61,6 +61,24 @@
         <string>public.comma-separated-values-text</string>
       </array>
     </dict>
+    <dict>
+      <key>CFBundleTypeName</key>
+      <string>Parquet Document</string>
+      <key>CFBundleTypeIconFile</key>
+      <string>Spread.icns</string>
+      <key>CFBundleTypeRole</key>
+      <string>Viewer</string>
+      <key>LSHandlerRank</key>
+      <string>Alternate</string>
+      <key>CFBundleTypeExtensions</key>
+      <array>
+        <string>parquet</string>
+      </array>
+      <key>LSItemContentTypes</key>
+      <array>
+        <string>org.apache.parquet</string>
+      </array>
+    </dict>
   </array>
 </dict>
 </plist>

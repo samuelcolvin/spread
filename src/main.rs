@@ -21,6 +21,7 @@ use crate::{
 };
 
 mod csv_source;
+mod parquet_source;
 mod view;
 mod workbook;
 

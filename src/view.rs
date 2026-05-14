@@ -21,7 +21,7 @@ use crate::{
 
 const MIN_ROW_HEADER_WIDTH: f32 = 48.0;
 const ROW_HEADER_DIGIT_WIDTH: f32 = 7.0;
-const ROW_HEADER_HORIZONTAL_PADDING: f32 = 20.0;
+const ROW_HEADER_HORIZONTAL_PADDING: f32 = 14.0;
 const HEADER_HEIGHT: f32 = 24.0;
 const SCROLLBAR_SIZE: f32 = 12.0;
 const MIN_THUMB_SIZE: f32 = 32.0;
@@ -366,9 +366,23 @@ fn row_offsets_for_heights(row_heights: &[f32]) -> Vec<f32> {
 }
 
 fn row_header_width(row_count: usize) -> f32 {
-    let digits = row_count.max(1).ilog10() + 1;
-    (digits as f32 * ROW_HEADER_DIGIT_WIDTH + ROW_HEADER_HORIZONTAL_PADDING)
+    let label_len = row_number_label(row_count.max(1)).len();
+    (label_len as f32 * ROW_HEADER_DIGIT_WIDTH + ROW_HEADER_HORIZONTAL_PADDING)
         .max(MIN_ROW_HEADER_WIDTH)
+}
+
+fn row_number_label(row_number: usize) -> String {
+    let raw = row_number.to_string();
+    let mut output = String::with_capacity(raw.len() + raw.len() / 3);
+
+    for (ix, ch) in raw.chars().enumerate() {
+        if ix > 0 && (raw.len() - ix).is_multiple_of(3) {
+            output.push(',');
+        }
+        output.push(ch);
+    }
+
+    output
 }
 
 #[derive(Clone, Debug)]
@@ -1725,7 +1739,7 @@ fn row_header(
         .border_b_1()
         .border_color(rgb(GRID_COLOR))
         .text_color(rgb(HEADER_TEXT))
-        .child((row_ix + 1).to_string())
+        .child(row_number_label(row_ix + 1))
         .child(
             div()
                 .absolute()
@@ -2072,9 +2086,18 @@ mod tests {
     #[test]
     fn row_header_width_grows_for_large_row_counts() {
         assert_float_eq(row_header_width(0), MIN_ROW_HEADER_WIDTH);
-        assert_float_eq(row_header_width(9_999), MIN_ROW_HEADER_WIDTH);
-        assert!(row_header_width(100_000) > MIN_ROW_HEADER_WIDTH);
+        assert_float_eq(row_header_width(999), MIN_ROW_HEADER_WIDTH);
+        assert!(row_header_width(9_999) > MIN_ROW_HEADER_WIDTH);
         assert!(row_header_width(1_000_000) > row_header_width(100_000));
+    }
+
+    #[test]
+    fn row_number_labels_use_thousand_separators() {
+        assert_eq!(row_number_label(1), "1");
+        assert_eq!(row_number_label(999), "999");
+        assert_eq!(row_number_label(1_000), "1,000");
+        assert_eq!(row_number_label(240_041), "240,041");
+        assert_eq!(row_number_label(1_000_000), "1,000,000");
     }
 
     fn assert_float_eq(left: f32, right: f32) {

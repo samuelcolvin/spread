@@ -981,11 +981,12 @@ pub(crate) fn load_workbook(path: &Path) -> Result<WorkbookData> {
         .as_deref()
     {
         Some("csv") => load_csv(path),
+        Some("parquet") => load_parquet(path),
         Some("xlsx") => load_xlsx(path),
         Some(extension) => {
-            bail!("unsupported file extension '.{extension}'; expected .csv or .xlsx")
+            bail!("unsupported file extension '.{extension}'; expected .csv, .parquet, or .xlsx")
         }
-        None => bail!("unsupported file without extension; expected .csv or .xlsx"),
+        None => bail!("unsupported file without extension; expected .csv, .parquet, or .xlsx"),
     }
 }
 
@@ -993,6 +994,13 @@ fn load_csv(path: &Path) -> Result<WorkbookData> {
     Ok(WorkbookData::new(
         path.to_owned(),
         vec![crate::csv_source::load_csv_sheet(path)?],
+    ))
+}
+
+fn load_parquet(path: &Path) -> Result<WorkbookData> {
+    Ok(WorkbookData::new(
+        path.to_owned(),
+        vec![crate::parquet_source::load_parquet_sheet(path)?],
     ))
 }
 
@@ -1913,7 +1921,10 @@ fn column_name(mut index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, fs, io::Write as _, time::SystemTime};
+    use arrow_array::{BooleanArray, Int64Array, RecordBatch, StringArray};
+    use arrow_schema::{DataType, Field, Schema};
+    use parquet::{arrow::ArrowWriter, file::properties::WriterProperties};
+    use std::{env, fs, io::Write as _, sync::Arc, time::SystemTime};
     use zip::{ZipWriter, write::SimpleFileOptions};
 
     #[test]
@@ -1953,6 +1964,48 @@ mod tests {
             SheetRowLayout::Uniform { row_count: 2, height }
                 if (height - DEFAULT_ROW_HEIGHT).abs() < f32::EPSILON
         ));
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn loads_parquet_lazily_with_schema_header() {
+        let path = temp_file("spread-test.parquet");
+        write_parquet_file(&path);
+
+        let workbook = load_workbook(&path).unwrap();
+
+        assert!(!workbook.sheet(0).is_fully_loaded());
+        assert_eq!(
+            workbook.sheet_name(0),
+            path.file_stem().unwrap().to_str().unwrap()
+        );
+        assert_eq!(workbook.row_count(), 4);
+        assert_eq!(workbook.col_count(), 3);
+        assert_eq!(workbook.cell(0, 0), "name");
+        assert_eq!(workbook.cell(0, 1), "score");
+        assert_eq!(workbook.cell(1, 0), "Ada");
+        assert_eq!(workbook.cell(3, 0), "Linus");
+        assert_eq!(workbook.cell(3, 1), "30");
+        assert_eq!(
+            workbook.cell_data(3, 1).raw_value,
+            CellRawValue::Number(30.0)
+        );
+        assert_eq!(
+            workbook.cell_data(2, 2).raw_value,
+            CellRawValue::Bool(false)
+        );
+        assert!(matches!(
+            workbook.sheet(0).row_layout(),
+            SheetRowLayout::Uniform { row_count: 4, height }
+                if (height - DEFAULT_ROW_HEIGHT).abs() < f32::EPSILON
+        ));
+
+        let summary = workbook
+            .sheet(0)
+            .summary_for_range(CellRange::new(CellCoord::new(1, 1), CellCoord::new(3, 1)));
+        assert_eq!(summary.numeric_cells, 3);
+        assert!((summary.sum - 60.0).abs() < f64::EPSILON);
 
         fs::remove_file(path).unwrap();
     }
@@ -2475,6 +2528,30 @@ mod tests {
         write_zip_entry(&mut zip, "xl/styles.xml", styles_xml, options);
         write_zip_entry(&mut zip, "xl/worksheets/sheet1.xml", sheet_xml, options);
         zip.finish().unwrap();
+    }
+
+    fn write_parquet_file(path: &Path) {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("name", DataType::Utf8, false),
+            Field::new("score", DataType::Int64, false),
+            Field::new("active", DataType::Boolean, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(vec!["Ada", "Grace", "Linus"])),
+                Arc::new(Int64Array::from(vec![10, 20, 30])),
+                Arc::new(BooleanArray::from(vec![true, false, true])),
+            ],
+        )
+        .unwrap();
+        let props = WriterProperties::builder()
+            .set_max_row_group_size(2)
+            .build();
+        let file = File::create(path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
     }
 
     fn write_zip_entry(
