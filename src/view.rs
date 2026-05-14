@@ -8,14 +8,15 @@ use std::{
 use gpui::{
     AnyElement, App, Bounds, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, FontWeight,
     IntoElement, ListAlignment, ListOffset, ListState, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, Render, ScrollHandle, Stateful, Window, actions, canvas, div,
-    list, point, prelude::*, px, rgb,
+    MouseUpEvent, Pixels, Point, Render, ScrollHandle, Stateful, TextRun, Window, actions, canvas,
+    div, font, list, point, prelude::*, px, rgb,
 };
 
 use crate::{
     CloseFile,
     workbook::{
-        CellCoord, CellData, CellRange, SelectionEdgeSides, SheetData, SheetRowLayout, WorkbookData,
+        CellCoord, CellData, CellRange, CellRawValue, SelectionEdgeSides, SheetData,
+        SheetRowLayout, WorkbookData,
     },
 };
 
@@ -43,6 +44,7 @@ const TITLE_BAR_HEIGHT: f32 = 40.0;
 const FORMULA_BAR_HEIGHT: f32 = 36.0;
 const FORMULA_BAR_LINE_HEIGHT: f32 = 17.0;
 const FORMULA_BAR_VERTICAL_PADDING: f32 = 12.0;
+const CELL_HORIZONTAL_PADDING: f32 = 16.0;
 const FOOTER_HEIGHT: f32 = 32.0;
 const RESIZE_HANDLE_SIZE: f32 = 6.0;
 const MIN_COLUMN_WIDTH: f32 = 24.0;
@@ -132,6 +134,13 @@ struct CellRenderState {
     selected: bool,
     selection_edges: SelectionEdgeSides,
     active: bool,
+}
+
+struct RowCell {
+    data: CellData,
+    text: String,
+    text_width: f32,
+    formula_fallback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -982,16 +991,16 @@ fn body_pane(
         .overflow_hidden()
         .on_scroll_wheel(horizontal_scroll_handler(horizontal_scroll, scroll_entity))
         .child(
-            list(body_list, move |row_ix, _, _| {
+            list(body_list, move |row_ix, window, _| {
                 let row_entity = list_entity.clone();
                 render_body_row(
-                    &workbook,
-                    sheet_ix,
+                    workbook.sheet(sheet_ix),
                     &layout,
                     row_ix,
                     row_horizontal_scroll.offset().x,
                     selection,
                     &row_entity,
+                    window,
                 )
             })
             .size_full(),
@@ -1629,15 +1638,14 @@ fn cell_address(coord: CellCoord) -> String {
 }
 
 fn render_body_row(
-    workbook: &WorkbookData,
-    sheet_ix: usize,
+    sheet: &SheetData,
     layout: &SheetLayout,
     row_ix: usize,
     horizontal_offset: Pixels,
     selection: Selection,
     entity: &Entity<SpreadsheetViewer>,
+    window: &mut Window,
 ) -> AnyElement {
-    let sheet = workbook.sheet(sheet_ix);
     let row_height = layout.row_height(row_ix);
 
     div()
@@ -1654,7 +1662,7 @@ fn render_body_row(
         ))
         .child(
             div().flex_1().h(px(row_height)).overflow_hidden().child(
-                render_cells_row(sheet, layout, row_ix, row_height, selection, entity)
+                render_cells_row(sheet, layout, row_ix, row_height, selection, entity, window)
                     .relative()
                     .left(horizontal_offset),
             ),
@@ -1669,16 +1677,33 @@ fn render_cells_row(
     row_height: f32,
     selection: Selection,
     entity: &Entity<SpreadsheetViewer>,
+    window: &mut Window,
 ) -> Stateful<Div> {
     let mut row = div()
         .id(("sheet-cells-row", row_ix))
         .flex()
+        .relative()
         .h(px(row_height))
         .w(px(layout.sheet_width));
 
-    for col_ix in 0..sheet.col_count() {
+    let cells = (0..sheet.col_count())
+        .map(|col_ix| {
+            let data = sheet.cell_data(row_ix, col_ix);
+            let (text, formula_fallback) = cell_display_text(&data);
+            let text_width = measure_cell_text_width(&data, &text, formula_fallback, window);
+            RowCell {
+                data,
+                text,
+                text_width,
+                formula_fallback,
+            }
+        })
+        .collect::<Vec<_>>();
+    let overflow_widths = overflow_text_widths(&cells, layout);
+
+    for (col_ix, row_cell) in cells.iter().enumerate() {
         row = row.child(cell(
-            &sheet.cell_data(row_ix, col_ix),
+            row_cell,
             layout.column_width(col_ix),
             row_height,
             CellRenderState {
@@ -1687,11 +1712,89 @@ fn render_cells_row(
                 selection_edges: selection.range.edge_sides(row_ix, col_ix),
                 active: selection.anchor == CellCoord::new(row_ix, col_ix),
             },
+            overflow_widths[col_ix].is_none(),
             entity,
         ));
     }
 
+    let mut left = 0.0;
+    for (col_ix, row_cell) in cells.iter().enumerate() {
+        if let Some(width) = overflow_widths[col_ix] {
+            row = row.child(cell_text_overlay(row_cell, left, width, row_height));
+        }
+        left += layout.column_width(col_ix);
+    }
+
     row
+}
+
+fn overflow_text_widths(cells: &[RowCell], layout: &SheetLayout) -> Vec<Option<f32>> {
+    let mut widths = vec![None; cells.len()];
+
+    for col_ix in 0..cells.len() {
+        let cell_content_width = (layout.column_width(col_ix) - CELL_HORIZONTAL_PADDING).max(0.0);
+        let cell = &cells[col_ix];
+        if !matches!(cell.data.raw_value, CellRawValue::Text)
+            || cell.formula_fallback
+            || cell.data.style.wrap_text
+            || cell.text.is_empty()
+            || cell.text_width <= cell_content_width
+        {
+            continue;
+        }
+
+        let mut end_col_ix = col_ix + 1;
+        while end_col_ix < cells.len() && cells[end_col_ix].text.is_empty() {
+            end_col_ix += 1;
+        }
+
+        if end_col_ix <= col_ix + 1 {
+            continue;
+        }
+
+        widths[col_ix] = Some((col_ix..end_col_ix).map(|ix| layout.column_width(ix)).sum());
+    }
+
+    widths
+}
+
+fn measure_cell_text_width(
+    cell: &CellData,
+    text: &str,
+    formula_fallback: bool,
+    window: &mut Window,
+) -> f32 {
+    if text.is_empty() || formula_fallback || cell.style.wrap_text {
+        return 0.0;
+    }
+
+    let mut text_font = font("Arial");
+    if cell.style.bold {
+        text_font = text_font.bold();
+    }
+    let text_color = if formula_fallback {
+        FORMULA_FALLBACK_TEXT
+    } else {
+        cell.style.text_color.unwrap_or(CELL_TEXT)
+    };
+    text.split('\n')
+        .map(|line| {
+            let run = TextRun {
+                len: line.len(),
+                font: text_font.clone(),
+                color: rgb(text_color).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .layout_line(line, px(12.0), &[run], None)
+                    .width,
+            )
+        })
+        .fold(0.0, f32::max)
 }
 
 fn corner_header(width: f32, entity: Entity<SpreadsheetViewer>) -> Div {
@@ -1873,15 +1976,18 @@ fn row_header(
 }
 
 fn cell(
-    cell: &CellData,
+    row_cell: &RowCell,
     width: f32,
     row_height: f32,
     state: CellRenderState,
+    render_text: bool,
     entity: &Entity<SpreadsheetViewer>,
 ) -> Div {
     let entity: Entity<SpreadsheetViewer> = (*entity).clone();
     let highlighted = state.active || state.selected;
-    let (cell_text, formula_fallback) = cell_display_text(cell);
+    let cell = &row_cell.data;
+    let cell_text = row_cell.text.as_str();
+    let formula_fallback = row_cell.formula_fallback;
     let multiline = cell.style.wrap_text || cell_text.contains('\n');
     let text_color = if formula_fallback {
         FORMULA_FALLBACK_TEXT
@@ -1925,7 +2031,11 @@ fn cell(
     }
 
     let drag_entity = entity.clone();
-    let mut element = element.child(cell_text);
+    let mut element = if render_text {
+        element.child(cell_text.to_owned())
+    } else {
+        element
+    };
 
     if highlighted {
         element = element.child(selection_outline(state.selection_edges));
@@ -1950,6 +2060,45 @@ fn cell(
                 }
             });
         })
+}
+
+fn cell_text_overlay(row_cell: &RowCell, left: f32, width: f32, row_height: f32) -> Div {
+    let cell = &row_cell.data;
+    let background_color = cell.style.background_color.unwrap_or(CELL_BG);
+    let mask_width = (row_cell.text_width + CELL_HORIZONTAL_PADDING).min(width);
+    let text_color = if row_cell.formula_fallback {
+        FORMULA_FALLBACK_TEXT
+    } else {
+        cell.style.text_color.unwrap_or(CELL_TEXT)
+    };
+    let multiline = row_cell.text.contains('\n');
+    let mut text = div()
+        .w(px(mask_width))
+        .h_full()
+        .flex()
+        .px_2()
+        .overflow_hidden()
+        .bg(rgb(background_color))
+        .text_color(rgb(text_color))
+        .when(!multiline, |element| {
+            element.items_center().whitespace_nowrap()
+        })
+        .when(multiline, |element| {
+            element.items_start().whitespace_normal()
+        });
+
+    if cell.style.bold {
+        text = text.font_weight(FontWeight::BOLD);
+    }
+
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(0.0))
+        .w(px(width))
+        .h(px((row_height - 1.0).max(0.0)))
+        .overflow_hidden()
+        .child(text.child(row_cell.text.clone()))
 }
 
 fn cell_display_text(cell: &CellData) -> (String, bool) {
@@ -2238,6 +2387,77 @@ mod tests {
     }
 
     #[test]
+    fn text_overflow_extends_across_empty_cells_until_next_value() {
+        let layout = layout_with_columns(vec![50.0, 60.0, 70.0, 80.0]);
+        let cells = vec![
+            text_row_cell("Long account name"),
+            empty_row_cell(),
+            text_row_cell("Next value"),
+            empty_row_cell(),
+        ];
+
+        let widths = overflow_text_widths(&cells, &layout);
+
+        assert_float_eq(widths[0].expect("first text cell should overflow"), 110.0);
+        assert!(widths[1].is_none());
+        assert_float_eq(widths[2].expect("third text cell should overflow"), 150.0);
+        assert!(widths[3].is_none());
+    }
+
+    #[test]
+    fn text_overflow_stays_clipped_when_right_cell_has_value() {
+        let layout = layout_with_columns(vec![50.0, 60.0]);
+        let cells = vec![text_row_cell("Long account name"), text_row_cell("Value")];
+
+        let widths = overflow_text_widths(&cells, &layout);
+
+        assert!(widths.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn fitting_text_does_not_mask_empty_cell_grid_lines() {
+        let layout = layout_with_columns(vec![120.0, 60.0]);
+        let cells = vec![text_row_cell("Short"), empty_row_cell()];
+
+        let widths = overflow_text_widths(&cells, &layout);
+
+        assert!(widths.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn multiline_text_overflow_uses_widest_line() {
+        let layout = layout_with_columns(vec![50.0, 60.0]);
+        let cells = vec![text_row_cell("short\nMuch longer line"), empty_row_cell()];
+
+        let widths = overflow_text_widths(&cells, &layout);
+
+        assert_float_eq(widths[0].expect("multiline text should overflow"), 110.0);
+        assert!(widths[1].is_none());
+    }
+
+    #[test]
+    fn non_text_cells_do_not_overflow_into_empty_cells() {
+        let layout = layout_with_columns(vec![50.0, 60.0]);
+        let cells = vec![
+            RowCell {
+                data: CellData {
+                    value: "1234567890".to_owned(),
+                    raw_value: CellRawValue::Number(1_234_567_890.0),
+                    ..Default::default()
+                },
+                text: "1234567890".to_owned(),
+                text_width: 100.0,
+                formula_fallback: false,
+            },
+            empty_row_cell(),
+        ];
+
+        let widths = overflow_text_widths(&cells, &layout);
+
+        assert!(widths.iter().all(Option::is_none));
+    }
+
+    #[test]
     fn lazy_sheets_update_less_often_during_scrollbar_drag() {
         assert_eq!(
             vertical_scroll_drag_update_interval(true),
@@ -2249,11 +2469,42 @@ mod tests {
         );
     }
 
+    fn text_row_cell(text: &str) -> RowCell {
+        RowCell {
+            data: CellData {
+                value: text.to_owned(),
+                raw_value: CellRawValue::Text,
+                ..Default::default()
+            },
+            text: text.to_owned(),
+            text_width: text.chars().count() as f32 * 7.0,
+            formula_fallback: false,
+        }
+    }
+
+    fn empty_row_cell() -> RowCell {
+        RowCell {
+            data: CellData::default(),
+            text: String::new(),
+            text_width: 0.0,
+            formula_fallback: false,
+        }
+    }
+
     fn test_layout(sheet_width: f32, sheet_height: f32) -> SheetLayout {
         SheetLayout {
             column_widths: vec![sheet_width],
             rows: RowLayout::from_explicit_heights(vec![sheet_height]),
             sheet_width,
+            row_header_width: MIN_ROW_HEADER_WIDTH,
+        }
+    }
+
+    fn layout_with_columns(column_widths: Vec<f32>) -> SheetLayout {
+        SheetLayout {
+            sheet_width: column_widths.iter().sum(),
+            column_widths,
+            rows: RowLayout::from_explicit_heights(vec![crate::workbook::DEFAULT_ROW_HEIGHT]),
             row_header_width: MIN_ROW_HEADER_WIDTH,
         }
     }
