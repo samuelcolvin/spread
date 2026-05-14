@@ -1720,7 +1720,20 @@ fn render_cells_row(
     let mut left = 0.0;
     for (col_ix, row_cell) in cells.iter().enumerate() {
         if let Some(width) = overflow_widths[col_ix] {
-            row = row.child(cell_text_overlay(row_cell, left, width, row_height));
+            let state = CellRenderState {
+                coord: CellCoord::new(row_ix, col_ix),
+                selected: selection.contains(row_ix, col_ix),
+                selection_edges: selection.range.edge_sides(row_ix, col_ix),
+                active: selection.anchor == CellCoord::new(row_ix, col_ix),
+            };
+            row = row.child(cell_text_overlay(
+                row_cell,
+                left,
+                layout.column_width(col_ix),
+                width,
+                row_height,
+                state,
+            ));
         }
         left += layout.column_width(col_ix);
     }
@@ -2062,23 +2075,40 @@ fn cell(
         })
 }
 
-fn cell_text_overlay(row_cell: &RowCell, left: f32, width: f32, row_height: f32) -> Div {
+fn cell_text_overlay(
+    row_cell: &RowCell,
+    left: f32,
+    source_width: f32,
+    width: f32,
+    row_height: f32,
+    state: CellRenderState,
+) -> Div {
     let cell = &row_cell.data;
-    let background_color = cell.style.background_color.unwrap_or(CELL_BG);
     let mask_width = (row_cell.text_width + CELL_HORIZONTAL_PADDING).min(width);
+    let source_mask_width = mask_width.min(source_width);
+    let overflow_mask_width = (mask_width - source_width).max(0.0);
+    let source_background = if state.active {
+        ACTIVE_CELL_BG
+    } else if state.selected {
+        SELECTED_CELL_BG
+    } else {
+        cell.style.background_color.unwrap_or(CELL_BG)
+    };
     let text_color = if row_cell.formula_fallback {
         FORMULA_FALLBACK_TEXT
     } else {
         cell.style.text_color.unwrap_or(CELL_TEXT)
     };
     let multiline = row_cell.text.contains('\n');
-    let mut text = div()
+    let mut text_layer = div()
+        .absolute()
+        .left(px(0.0))
+        .top(px(0.0))
         .w(px(mask_width))
-        .h_full()
+        .h(px((row_height - 1.0).max(0.0)))
         .flex()
         .px_2()
         .overflow_hidden()
-        .bg(rgb(background_color))
         .text_color(rgb(text_color))
         .when(!multiline, |element| {
             element.items_center().whitespace_nowrap()
@@ -2088,17 +2118,52 @@ fn cell_text_overlay(row_cell: &RowCell, left: f32, width: f32, row_height: f32)
         });
 
     if cell.style.bold {
-        text = text.font_weight(FontWeight::BOLD);
+        text_layer = text_layer.font_weight(FontWeight::BOLD);
     }
 
-    div()
+    let highlighted = state.active || state.selected;
+    let mut overlay = div()
         .absolute()
         .left(px(left))
         .top(px(0.0))
         .w(px(width))
-        .h(px((row_height - 1.0).max(0.0)))
+        .h(px(row_height))
         .overflow_hidden()
-        .child(text.child(row_cell.text.clone()))
+        .child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(source_mask_width))
+                .h(px((row_height - 1.0).max(0.0)))
+                .bg(rgb(source_background)),
+        )
+        .when(overflow_mask_width > 0.0, |element| {
+            element.child(
+                div()
+                    .absolute()
+                    .left(px(source_width))
+                    .top(px(0.0))
+                    .w(px(overflow_mask_width))
+                    .h(px((row_height - 1.0).max(0.0)))
+                    .bg(rgb(CELL_BG)),
+            )
+        })
+        .child(text_layer.child(row_cell.text.clone()));
+
+    if highlighted {
+        overlay = overlay.child(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .w(px(source_width))
+                .h(px(row_height))
+                .child(selection_outline(state.selection_edges)),
+        );
+    }
+
+    overlay
 }
 
 fn cell_display_text(cell: &CellData) -> (String, bool) {
