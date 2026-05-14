@@ -505,6 +505,10 @@ impl SheetData {
     pub(crate) fn range_to_tsv(&self, range: CellRange) -> String {
         debug_assert!(self.supports_full_range_operations());
         let range = range.normalized();
+        if range.start == range.end {
+            return self.cell_data(range.start.row, range.start.col).value;
+        }
+
         let mut output = String::new();
 
         for row_ix in range.start.row..=range.end.row {
@@ -2404,6 +2408,26 @@ mod tests {
         let copied = sheet.range_to_tsv(CellRange::new(CellCoord::new(1, 1), CellCoord::new(0, 0)));
 
         assert_eq!(copied, "2026-01-01\t$1,234.50\nline break\t15.2%");
+    }
+
+    #[test]
+    fn single_cell_tsv_preserves_multiline_text() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![vec![CellData {
+                value: "line\nbreak".to_owned(),
+                raw_value: CellRawValue::Text,
+                ..Default::default()
+            }]],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        let copied = sheet.range_to_tsv(CellRange::single(CellCoord::new(0, 0)));
+
+        assert_eq!(copied, "line\nbreak");
     }
 
     #[test]
