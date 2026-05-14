@@ -13,18 +13,23 @@ use arrow_array::{
 };
 use arrow_cast::display::array_value_to_string;
 use arrow_schema::{DataType, SchemaRef};
-use parquet::arrow::arrow_reader::{ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection,
+    RowSelector,
+};
 
 use crate::workbook::{
     CellData, CellRawValue, CellStyle, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT, SheetData,
     SheetRowLayout, SheetSource,
 };
 
-const PARQUET_ROW_CACHE_CAPACITY: usize = 512;
+const PARQUET_ROW_CACHE_CAPACITY: usize = 2_048;
+const PARQUET_ROW_WINDOW_SIZE: usize = 256;
 
 #[derive(Debug)]
 pub(crate) struct ParquetSheetSource {
     path: PathBuf,
+    reader_metadata: ArrowReaderMetadata,
     schema: SchemaRef,
     data_row_count: usize,
     row_groups: Vec<ParquetRowGroup>,
@@ -57,10 +62,10 @@ impl ParquetSheetSource {
     fn new(path: &Path) -> Result<Self> {
         let file = File::open(path)
             .with_context(|| format!("failed to open Parquet file {}", path.display()))?;
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        let reader_metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::default())
             .with_context(|| format!("failed to read Parquet metadata from {}", path.display()))?;
-        let metadata = builder.metadata();
-        let schema = builder.schema().clone();
+        let metadata = reader_metadata.metadata();
+        let schema = reader_metadata.schema().clone();
         let data_row_count = usize::try_from(metadata.file_metadata().num_rows())
             .with_context(|| format!("Parquet file {} has too many rows", path.display()))?;
         let mut row_groups = Vec::with_capacity(metadata.num_row_groups());
@@ -78,6 +83,7 @@ impl ParquetSheetSource {
 
         Ok(Self {
             path: path.to_owned(),
+            reader_metadata,
             schema,
             data_row_count,
             row_groups,
@@ -95,29 +101,47 @@ impl ParquetSheetSource {
             return Ok(cached);
         }
 
+        self.load_data_window(data_row)?;
+        self.cache
+            .lock()
+            .expect("Parquet cache poisoned")
+            .get(data_row)
+            .ok_or_else(|| anyhow!("Parquet row {data_row} was not loaded"))
+    }
+
+    fn load_data_window(&self, data_row: usize) -> Result<()> {
         let (row_group_ix, row_group) = self
             .row_group_for_data_row(data_row)
             .ok_or_else(|| anyhow!("Parquet row {data_row} is out of bounds"))?;
         let row_in_group = data_row - row_group.start_row;
-        let selection = row_selection_for_single_row(row_in_group, row_group.row_count);
+        let window_start = (row_in_group / PARQUET_ROW_WINDOW_SIZE) * PARQUET_ROW_WINDOW_SIZE;
+        let window_len = PARQUET_ROW_WINDOW_SIZE.min(row_group.row_count - window_start);
+        let selection = row_selection_for_range(window_start, window_len, row_group.row_count);
         let file = File::open(&self.path)
             .with_context(|| format!("failed to open Parquet file {}", self.path.display()))?;
-        let mut reader = ParquetRecordBatchReaderBuilder::try_new(file)?
-            .with_row_groups(vec![row_group_ix])
-            .with_row_selection(selection)
-            .with_batch_size(1)
-            .build()
-            .with_context(|| format!("failed to read Parquet row group {row_group_ix}"))?;
-        let row_data = match reader.next().transpose()? {
-            Some(batch) if batch.num_rows() > 0 => record_batch_row_to_cells(&batch, 0),
-            _ => Vec::new(),
-        };
+        let mut reader =
+            ParquetRecordBatchReaderBuilder::new_with_metadata(file, self.reader_metadata.clone())
+                .with_row_groups(vec![row_group_ix])
+                .with_row_selection(selection)
+                .with_batch_size(window_len)
+                .build()
+                .with_context(|| format!("failed to read Parquet row group {row_group_ix}"))?;
+        let mut loaded_rows = Vec::with_capacity(window_len);
+        let mut absolute_row = row_group.start_row + window_start;
+
+        for batch in &mut reader {
+            let batch = batch?;
+            for batch_row in 0..batch.num_rows() {
+                loaded_rows.push((absolute_row, record_batch_row_to_cells(&batch, batch_row)));
+                absolute_row += 1;
+            }
+        }
 
         self.cache
             .lock()
             .expect("Parquet cache poisoned")
-            .insert(data_row, row_data.clone());
-        Ok(row_data)
+            .insert_many(loaded_rows);
+        Ok(())
     }
 
     fn row_group_for_data_row(&self, data_row: usize) -> Option<(usize, ParquetRowGroup)> {
@@ -228,15 +252,27 @@ impl ParquetRowCache {
             self.rows.remove(&evicted);
         }
     }
+
+    fn insert_many(&mut self, rows: Vec<(usize, Vec<CellData>)>) {
+        for (row, row_data) in rows {
+            self.insert(row, row_data);
+        }
+    }
 }
 
-fn row_selection_for_single_row(row_in_group: usize, row_group_len: usize) -> RowSelection {
+fn row_selection_for_range(
+    start_row: usize,
+    row_count: usize,
+    row_group_len: usize,
+) -> RowSelection {
     let mut selectors = Vec::new();
-    if row_in_group > 0 {
-        selectors.push(RowSelector::skip(row_in_group));
+    if start_row > 0 {
+        selectors.push(RowSelector::skip(start_row));
     }
-    selectors.push(RowSelector::select(1));
-    let remaining = row_group_len.saturating_sub(row_in_group + 1);
+    if row_count > 0 {
+        selectors.push(RowSelector::select(row_count));
+    }
+    let remaining = row_group_len.saturating_sub(start_row + row_count);
     if remaining > 0 {
         selectors.push(RowSelector::skip(remaining));
     }

@@ -61,6 +61,20 @@ impl WorkbookData {
         Self { path, sheets }
     }
 
+    pub(crate) fn placeholder() -> Self {
+        Self::new(
+            PathBuf::from("spreadsheet"),
+            vec![SheetData::new(
+                None,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                DEFAULT_COLUMN_WIDTH,
+                DEFAULT_ROW_HEIGHT,
+            )],
+        )
+    }
+
     pub(crate) fn sheet_count(&self) -> usize {
         self.sheets.len()
     }

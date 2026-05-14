@@ -48,6 +48,7 @@ const RESIZE_HANDLE_SIZE: f32 = 6.0;
 const MIN_COLUMN_WIDTH: f32 = 24.0;
 const MIN_ROW_HEIGHT: f32 = 18.0;
 const VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
+const LAZY_VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL: Duration = Duration::from_millis(200);
 
 pub(crate) const WINDOW_WIDTH: f32 = 1100.0;
 pub(crate) const WINDOW_HEIGHT: f32 = 720.0;
@@ -385,6 +386,14 @@ fn row_number_label(row_number: usize) -> String {
     output
 }
 
+fn vertical_scroll_drag_update_interval(is_fully_loaded: bool) -> Duration {
+    if is_fully_loaded {
+        VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL
+    } else {
+        LAZY_VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL
+    }
+}
+
 #[derive(Clone, Debug)]
 enum ResizeDrag {
     Columns {
@@ -455,11 +464,17 @@ impl SpreadsheetViewer {
         write_rich_clipboard(&text, &html, cx);
     }
 
-    fn close_file(&mut self, _: &CloseFile, window: &mut Window, _: &mut Context<'_, Self>) {
+    fn close_file(&mut self, _: &CloseFile, window: &mut Window, cx: &mut Context<'_, Self>) {
         // Handle Close File inside the document window, not as a global app action.
         // GPUI menu actions are dispatched through the active window first; removing
         // this exact window here avoids guessing which app window should be closed.
         self.show_splash_after_close.set(true);
+        let workbook = std::mem::replace(&mut self.workbook, Arc::new(WorkbookData::placeholder()));
+        cx.background_executor()
+            .spawn(async move {
+                drop(workbook);
+            })
+            .detach();
         window.remove_window();
     }
 
@@ -1194,8 +1209,11 @@ fn list_scrollbar_thumb(
                             }) => last_sheet_update,
                             _ => now,
                         };
-                        let should_update_sheet = now.duration_since(last_sheet_update)
-                            >= VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL;
+                        let update_interval = vertical_scroll_drag_update_interval(
+                            viewer.active_sheet().is_fully_loaded(),
+                        );
+                        let should_update_sheet =
+                            now.duration_since(last_sheet_update) >= update_interval;
 
                         let last_sheet_update = if should_update_sheet {
                             viewer.scroll_list_to_vertical_position(&list_state, scroll_position);
@@ -2098,6 +2116,18 @@ mod tests {
         assert_eq!(row_number_label(1_000), "1,000");
         assert_eq!(row_number_label(240_041), "240,041");
         assert_eq!(row_number_label(1_000_000), "1,000,000");
+    }
+
+    #[test]
+    fn lazy_sheets_update_less_often_during_scrollbar_drag() {
+        assert_eq!(
+            vertical_scroll_drag_update_interval(true),
+            VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL
+        );
+        assert_eq!(
+            vertical_scroll_drag_update_interval(false),
+            LAZY_VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL
+        );
     }
 
     fn assert_float_eq(left: f32, right: f32) {
