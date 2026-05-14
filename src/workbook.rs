@@ -44,7 +44,7 @@ pub(crate) enum SheetRowLayout {
     Explicit { heights: Vec<f32> },
 }
 
-trait SheetSource: Any + Send + Sync + std::fmt::Debug {
+pub(crate) trait SheetSource: Any + Send + Sync + std::fmt::Debug {
     fn as_any_mut(&mut self) -> &mut dyn Any;
     fn row_count(&self) -> usize;
     fn col_count(&self) -> usize;
@@ -226,24 +226,6 @@ impl SheetData {
         )
     }
 
-    fn new_uniform_rows(
-        sheet_name: Option<String>,
-        rows: Vec<Vec<CellData>>,
-        column_widths: Vec<f32>,
-        default_column_width: f32,
-        default_row_height: f32,
-    ) -> Self {
-        Self::new_with_row_mode(
-            sheet_name,
-            rows,
-            column_widths,
-            Vec::new(),
-            default_column_width,
-            default_row_height,
-            EagerRowHeightMode::Uniform,
-        )
-    }
-
     fn new_with_row_mode(
         sheet_name: Option<String>,
         rows: Vec<Vec<CellData>>,
@@ -265,6 +247,16 @@ impl SheetData {
 
         Self {
             name,
+            source: Arc::new(source),
+        }
+    }
+
+    pub(crate) fn from_source(
+        sheet_name: Option<String>,
+        source: impl SheetSource + 'static,
+    ) -> Self {
+        Self {
+            name: sheet_name.unwrap_or_else(|| "Sheet1".to_owned()),
             source: Arc::new(source),
         }
     }
@@ -328,7 +320,6 @@ impl SheetData {
 #[derive(Debug, Clone, Copy)]
 enum EagerRowHeightMode {
     Auto,
-    Uniform,
 }
 
 impl EagerSheetSource {
@@ -351,7 +342,6 @@ impl EagerSheetSource {
                 default_row_height,
                 row_count,
             ),
-            EagerRowHeightMode::Uniform => Vec::new(),
         };
 
         Self {
@@ -1000,36 +990,9 @@ pub(crate) fn load_workbook(path: &Path) -> Result<WorkbookData> {
 }
 
 fn load_csv(path: &Path) -> Result<WorkbookData> {
-    let mut reader = csv::ReaderBuilder::new()
-        .flexible(true)
-        .has_headers(false)
-        .from_path(path)
-        .with_context(|| format!("failed to open CSV file {}", path.display()))?;
-
-    let mut rows = Vec::new();
-    for record in reader.records() {
-        let record =
-            record.with_context(|| format!("failed to read CSV record from {}", path.display()))?;
-        rows.push(
-            record
-                .iter()
-                .map(|value| CellData {
-                    value: value.to_owned(),
-                    ..Default::default()
-                })
-                .collect(),
-        );
-    }
-
     Ok(WorkbookData::new(
         path.to_owned(),
-        vec![SheetData::new_uniform_rows(
-            None,
-            rows,
-            Vec::new(),
-            DEFAULT_COLUMN_WIDTH,
-            DEFAULT_ROW_HEIGHT,
-        )],
+        vec![crate::csv_source::load_csv_sheet(path)?],
     ))
 }
 
@@ -1983,6 +1946,8 @@ mod tests {
 
         let workbook = load_csv(&path).unwrap();
 
+        assert!(!workbook.sheet(0).is_fully_loaded());
+        assert_eq!(workbook.cell(1, 1), "line 1\nline 2");
         assert!(matches!(
             workbook.sheet(0).row_layout(),
             SheetRowLayout::Uniform { row_count: 2, height }

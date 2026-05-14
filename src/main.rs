@@ -20,6 +20,7 @@ use crate::{
     workbook::load_workbook,
 };
 
+mod csv_source;
 mod view;
 mod workbook;
 
