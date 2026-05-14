@@ -146,6 +146,12 @@ enum ScrollbarDrag {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ScrollbarVisibility {
+    horizontal: bool,
+    vertical: bool,
+}
+
 #[derive(Clone)]
 struct SheetLayout {
     column_widths: Vec<f32>,
@@ -726,11 +732,25 @@ impl Focusable for SpreadsheetViewer {
 }
 
 impl Render for SpreadsheetViewer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
         let workbook = Arc::clone(&self.workbook);
         let sheet_ix = self.active_sheet;
         let selection = self.selection;
         let layout = self.active_layout().clone();
+        let formula_height = formula_bar_height_for_sheet(workbook.sheet(sheet_ix), selection);
+        let window_size = window.bounds().size;
+        let scrollbars = scrollbar_visibility_for_window_size(
+            &layout,
+            formula_height,
+            f32::from(window_size.width),
+            f32::from(window_size.height),
+        );
+        if !scrollbars.horizontal {
+            let offset = self.horizontal_scroll.offset();
+            if offset.x != px(0.0) {
+                self.horizontal_scroll.set_offset(point(px(0.0), offset.y));
+            }
+        }
         let entity = cx.entity();
         let focus_handle = self.focus_handle.clone();
 
@@ -786,13 +806,15 @@ impl Render for SpreadsheetViewer {
                         &self.horizontal_scroll,
                         &cx.entity(),
                     ))
-                    .child(
-                        div()
-                            .w(px(SCROLLBAR_SIZE))
-                            .h_full()
-                            .flex_none()
-                            .bg(rgb(HEADER_BG)),
-                    ),
+                    .when(scrollbars.vertical, |element| {
+                        element.child(
+                            div()
+                                .w(px(SCROLLBAR_SIZE))
+                                .h_full()
+                                .flex_none()
+                                .bg(rgb(HEADER_BG)),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -807,25 +829,71 @@ impl Render for SpreadsheetViewer {
                         self.body_list.clone(),
                         &cx.entity(),
                     ))
-                    .child(vertical_scrollbar(self, cx)),
+                    .when(scrollbars.vertical, |element| {
+                        element.child(vertical_scrollbar(self, cx))
+                    }),
             )
-            .child(
-                div()
-                    .flex()
-                    .h(px(SCROLLBAR_SIZE))
-                    .flex_none()
-                    .child(div().w(px(layout.row_header_width)).h_full().flex_none())
-                    .child(horizontal_scrollbar(self, cx))
-                    .child(
-                        div()
-                            .w(px(SCROLLBAR_SIZE))
-                            .h_full()
-                            .flex_none()
-                            .bg(rgb(HEADER_BG)),
-                    ),
-            )
+            .when(scrollbars.horizontal, |element| {
+                element.child(
+                    div()
+                        .flex()
+                        .h(px(SCROLLBAR_SIZE))
+                        .flex_none()
+                        .child(div().w(px(layout.row_header_width)).h_full().flex_none())
+                        .child(horizontal_scrollbar(self, cx))
+                        .when(scrollbars.vertical, |element| {
+                            element.child(
+                                div()
+                                    .w(px(SCROLLBAR_SIZE))
+                                    .h_full()
+                                    .flex_none()
+                                    .bg(rgb(HEADER_BG)),
+                            )
+                        }),
+                )
+            })
             .child(footer(self, cx))
     }
+}
+
+fn scrollbar_visibility_for_window_size(
+    layout: &SheetLayout,
+    formula_height: f32,
+    window_width: f32,
+    window_height: f32,
+) -> ScrollbarVisibility {
+    let body_width = (window_width - layout.row_header_width).max(0.0);
+    let body_height =
+        (window_height - TITLE_BAR_HEIGHT - formula_height - HEADER_HEIGHT - FOOTER_HEIGHT)
+            .max(0.0);
+
+    let mut visibility = ScrollbarVisibility {
+        horizontal: layout.sheet_width > body_width,
+        vertical: layout.sheet_height() > body_height,
+    };
+
+    for _ in 0..2 {
+        let available_width = if visibility.vertical {
+            (body_width - SCROLLBAR_SIZE).max(0.0)
+        } else {
+            body_width
+        };
+        let available_height = if visibility.horizontal {
+            (body_height - SCROLLBAR_SIZE).max(0.0)
+        } else {
+            body_height
+        };
+        let next = ScrollbarVisibility {
+            horizontal: layout.sheet_width > available_width,
+            vertical: layout.sheet_height() > available_height,
+        };
+        if next == visibility {
+            break;
+        }
+        visibility = next;
+    }
+
+    visibility
 }
 
 fn title_bar(workbook: &WorkbookData, sheet_ix: usize) -> Div {
@@ -942,7 +1010,9 @@ fn horizontal_scroll_handler(
         }
 
         let current = horizontal_scroll.offset();
-        horizontal_scroll.set_offset(point(current.x + delta.x, current.y));
+        let max_offset = horizontal_scroll.max_offset().width;
+        let next_x = (current.x + delta.x).clamp(-max_offset, px(0.0));
+        horizontal_scroll.set_offset(point(next_x, current.y));
         cx.notify(entity.entity_id());
         cx.stop_propagation();
     }
@@ -1318,12 +1388,7 @@ fn scrollbar_position_to_scroll_offset(
 }
 
 fn formula_bar(sheet: &SheetData, selection: Selection) -> Div {
-    let cell = sheet.cell_data(selection.anchor.row, selection.anchor.col);
-    let formula_value = cell
-        .formula
-        .as_ref()
-        .map(|formula| formula_display_text(formula))
-        .unwrap_or(cell.value);
+    let formula_value = formula_bar_value(sheet, selection);
     let multiline = formula_value.contains('\n');
     let height = formula_bar_height(&formula_value);
     let field_height = (height - FORMULA_BAR_VERTICAL_PADDING).max(24.0);
@@ -1370,6 +1435,18 @@ fn formula_bar(sheet: &SheetData, selection: Selection) -> Div {
                 .when(multiline, Styled::whitespace_normal)
                 .child(formula_value),
         )
+}
+
+fn formula_bar_height_for_sheet(sheet: &SheetData, selection: Selection) -> f32 {
+    formula_bar_height(&formula_bar_value(sheet, selection))
+}
+
+fn formula_bar_value(sheet: &SheetData, selection: Selection) -> String {
+    let cell = sheet.cell_data(selection.anchor.row, selection.anchor.col);
+    cell.formula.as_ref().map_or_else(
+        || cell.value.clone(),
+        |formula| formula_display_text(formula),
+    )
 }
 
 fn formula_bar_height(value: &str) -> f32 {
@@ -2119,6 +2196,48 @@ mod tests {
     }
 
     #[test]
+    fn scrollbar_visibility_hides_bars_when_sheet_fits() {
+        let layout = test_layout(100.0, 80.0);
+        let visibility = scrollbar_visibility_for_window_size(
+            &layout,
+            FORMULA_BAR_HEIGHT,
+            layout.row_header_width + 120.0,
+            fixed_view_height() + 100.0,
+        );
+
+        assert!(!visibility.horizontal);
+        assert!(!visibility.vertical);
+    }
+
+    #[test]
+    fn vertical_scrollbar_can_require_horizontal_scrollbar() {
+        let layout = test_layout(105.0, 200.0);
+        let visibility = scrollbar_visibility_for_window_size(
+            &layout,
+            FORMULA_BAR_HEIGHT,
+            layout.row_header_width + 110.0,
+            fixed_view_height() + 100.0,
+        );
+
+        assert!(visibility.vertical);
+        assert!(visibility.horizontal);
+    }
+
+    #[test]
+    fn horizontal_scrollbar_can_require_vertical_scrollbar() {
+        let layout = test_layout(200.0, 95.0);
+        let visibility = scrollbar_visibility_for_window_size(
+            &layout,
+            FORMULA_BAR_HEIGHT,
+            layout.row_header_width + 100.0,
+            fixed_view_height() + 100.0,
+        );
+
+        assert!(visibility.horizontal);
+        assert!(visibility.vertical);
+    }
+
+    #[test]
     fn lazy_sheets_update_less_often_during_scrollbar_drag() {
         assert_eq!(
             vertical_scroll_drag_update_interval(true),
@@ -2128,6 +2247,19 @@ mod tests {
             vertical_scroll_drag_update_interval(false),
             LAZY_VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL
         );
+    }
+
+    fn test_layout(sheet_width: f32, sheet_height: f32) -> SheetLayout {
+        SheetLayout {
+            column_widths: vec![sheet_width],
+            rows: RowLayout::from_explicit_heights(vec![sheet_height]),
+            sheet_width,
+            row_header_width: MIN_ROW_HEADER_WIDTH,
+        }
+    }
+
+    fn fixed_view_height() -> f32 {
+        TITLE_BAR_HEIGHT + FORMULA_BAR_HEIGHT + HEADER_HEIGHT + FOOTER_HEIGHT
     }
 
     fn assert_float_eq(left: f32, right: f32) {
