@@ -19,7 +19,9 @@ use crate::{
     },
 };
 
-const ROW_HEADER_WIDTH: f32 = 48.0;
+const MIN_ROW_HEADER_WIDTH: f32 = 48.0;
+const ROW_HEADER_DIGIT_WIDTH: f32 = 7.0;
+const ROW_HEADER_HORIZONTAL_PADDING: f32 = 20.0;
 const HEADER_HEIGHT: f32 = 24.0;
 const SCROLLBAR_SIZE: f32 = 12.0;
 const MIN_THUMB_SIZE: f32 = 32.0;
@@ -148,6 +150,7 @@ struct SheetLayout {
     column_widths: Vec<f32>,
     rows: RowLayout,
     sheet_width: f32,
+    row_header_width: f32,
 }
 
 #[derive(Clone)]
@@ -174,6 +177,7 @@ impl SheetLayout {
             column_widths,
             rows,
             sheet_width,
+            row_header_width: row_header_width(sheet.row_count()),
         }
     }
 
@@ -359,6 +363,12 @@ fn row_offsets_for_heights(row_heights: &[f32]) -> Vec<f32> {
     }
 
     offsets
+}
+
+fn row_header_width(row_count: usize) -> f32 {
+    let digits = row_count.max(1).ilog10() + 1;
+    (digits as f32 * ROW_HEADER_DIGIT_WIDTH + ROW_HEADER_HORIZONTAL_PADDING)
+        .max(MIN_ROW_HEADER_WIDTH)
 }
 
 #[derive(Clone, Debug)]
@@ -738,7 +748,7 @@ impl Render for SpreadsheetViewer {
                     .flex()
                     .h(px(HEADER_HEIGHT))
                     .flex_none()
-                    .child(corner_header(cx.entity()))
+                    .child(corner_header(layout.row_header_width, cx.entity()))
                     .child(column_header_pane(
                         &workbook,
                         sheet_ix,
@@ -775,7 +785,7 @@ impl Render for SpreadsheetViewer {
                     .flex()
                     .h(px(SCROLLBAR_SIZE))
                     .flex_none()
-                    .child(div().w(px(ROW_HEADER_WIDTH)).h_full().flex_none())
+                    .child(div().w(px(layout.row_header_width)).h_full().flex_none())
                     .child(horizontal_scrollbar(self, cx))
                     .child(
                         div()
@@ -1529,6 +1539,7 @@ fn render_body_row(
         .child(row_header(
             row_ix,
             row_height,
+            layout.row_header_width,
             selection.range.intersects_row(row_ix),
             entity,
         ))
@@ -1574,9 +1585,9 @@ fn render_cells_row(
     row
 }
 
-fn corner_header(entity: Entity<SpreadsheetViewer>) -> Div {
+fn corner_header(width: f32, entity: Entity<SpreadsheetViewer>) -> Div {
     div()
-        .w(px(ROW_HEADER_WIDTH))
+        .w(px(width))
         .h(px(HEADER_HEIGHT))
         .flex_none()
         .bg(rgb(HEADER_BG))
@@ -1686,6 +1697,7 @@ fn column_header(
 fn row_header(
     row_ix: usize,
     row_height: f32,
+    width: f32,
     selected: bool,
     entity: &Entity<SpreadsheetViewer>,
 ) -> Div {
@@ -1694,7 +1706,7 @@ fn row_header(
     let drag_entity = entity.clone();
 
     div()
-        .w(px(ROW_HEADER_WIDTH))
+        .w(px(width))
         .h(px(row_height))
         .flex()
         .items_center()
@@ -2016,6 +2028,7 @@ mod tests {
             column_widths: vec![100.0, 120.0],
             rows: RowLayout::from_explicit_heights(vec![24.0, 30.0]),
             sheet_width: 220.0,
+            row_header_width: MIN_ROW_HEADER_WIDTH,
         };
 
         layout.set_column_widths(&[(0, 140.0), (1, 1.0)]);
@@ -2042,6 +2055,7 @@ mod tests {
                 height: 24.0,
             }),
             sheet_width: 100.0,
+            row_header_width: row_header_width(1_000_000),
         };
 
         assert_float_eq(layout.row_height(999_999), 24.0);
@@ -2053,6 +2067,14 @@ mod tests {
 
         assert_float_eq(layout.row_height(0), 30.0);
         assert_float_eq(layout.row_height(3), 24.0);
+    }
+
+    #[test]
+    fn row_header_width_grows_for_large_row_counts() {
+        assert_float_eq(row_header_width(0), MIN_ROW_HEADER_WIDTH);
+        assert_float_eq(row_header_width(9_999), MIN_ROW_HEADER_WIDTH);
+        assert!(row_header_width(100_000) > MIN_ROW_HEADER_WIDTH);
+        assert!(row_header_width(1_000_000) > row_header_width(100_000));
     }
 
     fn assert_float_eq(left: f32, right: f32) {
