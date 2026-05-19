@@ -296,13 +296,6 @@ impl SheetData {
         }
     }
 
-    pub(crate) fn from_source(
-        sheet_name: Option<String>,
-        source: impl SheetSource + 'static,
-    ) -> Self {
-        Self::from_source_with_freeze(sheet_name, source, SheetFreeze::default())
-    }
-
     pub(crate) fn from_source_with_freeze(
         sheet_name: Option<String>,
         source: impl SheetSource + 'static,
