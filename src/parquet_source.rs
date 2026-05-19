@@ -20,7 +20,7 @@ use parquet::arrow::arrow_reader::{
 
 use crate::workbook::{
     CellData, CellRawValue, CellStyle, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT, SheetData,
-    SheetRowLayout, SheetSource,
+    SheetFreeze, SheetRowLayout, SheetSource,
 };
 
 const PARQUET_ROW_CACHE_CAPACITY: usize = 2_048;
@@ -55,7 +55,14 @@ pub(crate) fn load_parquet_sheet(path: &Path) -> Result<SheetData> {
         .file_stem()
         .and_then(|name| name.to_str())
         .map(str::to_owned);
-    Ok(SheetData::from_source(sheet_name, source))
+    Ok(SheetData::from_source_with_freeze(
+        sheet_name,
+        source,
+        SheetFreeze {
+            rows: 1,
+            columns: 0,
+        },
+    ))
 }
 
 impl ParquetSheetSource {

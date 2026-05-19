@@ -47,6 +47,10 @@ const FORMULA_BAR_VERTICAL_PADDING: f32 = 12.0;
 const CELL_HORIZONTAL_PADDING: f32 = 16.0;
 const FOOTER_HEIGHT: f32 = 32.0;
 const RESIZE_HANDLE_SIZE: f32 = 6.0;
+const FREEZE_HANDLE_HIT_SIZE: f32 = 8.0;
+const FREEZE_HANDLE_VISUAL_SIZE: f32 = 4.0;
+const FREEZE_LINE_SIZE: f32 = 6.0;
+const FREEZE_LINE_COLOR: u32 = 0xb8_bd_c5;
 const MIN_COLUMN_WIDTH: f32 = 24.0;
 const MIN_ROW_HEIGHT: f32 = 18.0;
 const VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL: Duration = Duration::from_millis(50);
@@ -71,6 +75,7 @@ pub(crate) struct SpreadsheetViewer {
     body_list: ListState,
     scrollbar_drag: Option<ScrollbarDrag>,
     resize_drag: Option<ResizeDrag>,
+    freeze_drag: Option<FreezeDrag>,
     layouts: Vec<SheetLayout>,
 }
 
@@ -167,6 +172,8 @@ struct SheetLayout {
     rows: RowLayout,
     sheet_width: f32,
     row_header_width: f32,
+    pinned_rows: usize,
+    pinned_columns: usize,
 }
 
 #[derive(Clone)]
@@ -194,6 +201,8 @@ impl SheetLayout {
             rows,
             sheet_width,
             row_header_width: row_header_width(sheet.row_count()),
+            pinned_rows: sheet.freeze().rows.min(sheet.row_count()),
+            pinned_columns: sheet.freeze().columns.min(sheet.col_count()),
         }
     }
 
@@ -210,6 +219,58 @@ impl SheetLayout {
 
     fn sheet_height(&self) -> f32 {
         self.rows.sheet_height()
+    }
+
+    fn pinned_column_width(&self) -> f32 {
+        self.columns_width(0, self.pinned_columns)
+    }
+
+    fn pinned_row_height(&self) -> f32 {
+        self.rows_height(0, self.pinned_rows)
+    }
+
+    fn scrollable_width(&self) -> f32 {
+        (self.sheet_width - self.pinned_column_width()).max(0.0)
+    }
+
+    fn scrollable_height(&self) -> f32 {
+        (self.sheet_height() - self.pinned_row_height()).max(0.0)
+    }
+
+    fn scrollable_row_count(&self) -> usize {
+        self.rows.row_count().saturating_sub(self.pinned_rows)
+    }
+
+    fn columns_width(&self, start_col: usize, end_col: usize) -> f32 {
+        let end_col = end_col.min(self.column_widths.len());
+        (start_col.min(end_col)..end_col)
+            .map(|col_ix| self.column_width(col_ix))
+            .sum()
+    }
+
+    fn rows_height(&self, start_row: usize, end_row: usize) -> f32 {
+        let end_row = end_row.min(self.rows.row_count());
+        (start_row.min(end_row)..end_row)
+            .map(|row_ix| self.row_height(row_ix))
+            .sum()
+    }
+
+    fn set_pinned_columns(&mut self, columns: usize) -> bool {
+        let columns = columns.min(self.column_widths.len());
+        if self.pinned_columns == columns {
+            return false;
+        }
+        self.pinned_columns = columns;
+        true
+    }
+
+    fn set_pinned_rows(&mut self, rows: usize) -> bool {
+        let rows = rows.min(self.rows.row_count());
+        if self.pinned_rows == rows {
+            return false;
+        }
+        self.pinned_rows = rows;
+        true
     }
 
     fn scroll_position_for_row_offset(&self, row_ix: usize, offset_in_row: f32) -> f32 {
@@ -277,6 +338,13 @@ impl RowLayout {
         match self {
             Self::Uniform { row_count, height } => *row_count as f32 * *height,
             Self::Explicit { row_offsets, .. } => row_offsets.last().copied().unwrap_or(0.0),
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        match self {
+            Self::Uniform { row_count, .. } => *row_count,
+            Self::Explicit { row_heights, .. } => row_heights.len(),
         }
     }
 
@@ -401,6 +469,60 @@ fn row_number_label(row_number: usize) -> String {
     output
 }
 
+fn freeze_target_column(layout: &SheetLayout, pointer_x: f32) -> usize {
+    freeze_target_for_sizes(
+        pointer_x,
+        layout
+            .column_widths
+            .iter()
+            .enumerate()
+            .map(|(col_ix, _)| layout.column_width(col_ix)),
+    )
+}
+
+fn freeze_target_row(layout: &SheetLayout, pointer_y: f32) -> usize {
+    freeze_target_for_sizes(
+        pointer_y,
+        (0..layout.rows.row_count()).map(|row_ix| layout.row_height(row_ix)),
+    )
+}
+
+fn freeze_target_for_sizes(position: f32, sizes: impl IntoIterator<Item = f32>) -> usize {
+    if position <= 0.0 {
+        return 0;
+    }
+
+    let mut boundary = 0.0;
+    let mut count = 0;
+    for size in sizes {
+        let size = size.max(0.0);
+        if position < boundary + size / 2.0 {
+            return count;
+        }
+        boundary += size;
+        count += 1;
+    }
+    count
+}
+
+fn scrollable_scroll_position_for_list_offset(
+    layout: &SheetLayout,
+    item_ix: usize,
+    offset_in_item: f32,
+) -> f32 {
+    let row_ix = layout.pinned_rows + item_ix;
+    layout.scroll_position_for_row_offset(row_ix, offset_in_item) - layout.pinned_row_height()
+}
+
+fn list_offset_for_scrollable_scroll_position(
+    layout: &SheetLayout,
+    scroll_position: f32,
+) -> (usize, f32) {
+    let (row_ix, offset_in_item) =
+        layout.row_offset_for_scroll_position(scroll_position + layout.pinned_row_height());
+    (row_ix.saturating_sub(layout.pinned_rows), offset_in_item)
+}
+
 fn vertical_scroll_drag_update_interval(is_fully_loaded: bool) -> Duration {
     if is_fully_loaded {
         VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL
@@ -423,6 +545,12 @@ enum ResizeDrag {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FreezeDrag {
+    Columns { axis_origin_x: Pixels },
+    Rows { axis_origin_y: Pixels },
+}
+
 impl SpreadsheetViewer {
     pub(crate) fn new(
         workbook: Arc<WorkbookData>,
@@ -431,17 +559,19 @@ impl SpreadsheetViewer {
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
-        let body_list = ListState::new(
-            workbook.sheet(active_sheet).row_count(),
-            ListAlignment::Top,
-            px(800.0),
-        );
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
 
-        let layouts = (0..workbook.sheet_count())
+        let layouts: Vec<SheetLayout> = (0..workbook.sheet_count())
             .map(|sheet_ix| SheetLayout::new(workbook.sheet(sheet_ix)))
             .collect();
+        let body_list = ListState::new(
+            layouts
+                .get(active_sheet)
+                .map_or(0, SheetLayout::scrollable_row_count),
+            ListAlignment::Top,
+            px(800.0),
+        );
 
         Self {
             workbook,
@@ -457,6 +587,7 @@ impl SpreadsheetViewer {
             body_list,
             scrollbar_drag: None,
             resize_drag: None,
+            freeze_drag: None,
             layouts,
         }
     }
@@ -503,7 +634,8 @@ impl SpreadsheetViewer {
         self.selection_drag = None;
         self.show_summary_menu = false;
         self.horizontal_scroll.set_offset(point(px(0.0), px(0.0)));
-        self.body_list.reset(self.active_sheet().row_count());
+        self.body_list
+            .reset(self.active_layout().scrollable_row_count());
         true
     }
 
@@ -656,7 +788,11 @@ impl SpreadsheetViewer {
     }
 
     fn invalidate_rows(&self, rows: impl IntoIterator<Item = usize>) {
-        let mut rows = rows.into_iter().collect::<Vec<_>>();
+        let pinned_rows = self.active_layout().pinned_rows;
+        let mut rows = rows
+            .into_iter()
+            .filter_map(|row_ix| row_ix.checked_sub(pinned_rows))
+            .collect::<Vec<_>>();
         if rows.is_empty() {
             return;
         }
@@ -684,6 +820,71 @@ impl SpreadsheetViewer {
 
     fn end_resize(&mut self) {
         self.resize_drag = None;
+    }
+
+    fn start_column_freeze_drag(&mut self, pointer_x: Pixels) {
+        let axis_origin_x = pointer_x - px(self.active_layout().pinned_column_width());
+        self.selection_drag = None;
+        self.resize_drag = None;
+        self.freeze_drag = Some(FreezeDrag::Columns { axis_origin_x });
+        self.show_summary_menu = false;
+    }
+
+    fn start_column_freeze_drag_from_zero(&mut self, pointer_x: Pixels) {
+        self.selection_drag = None;
+        self.resize_drag = None;
+        self.freeze_drag = Some(FreezeDrag::Columns {
+            axis_origin_x: pointer_x,
+        });
+        self.show_summary_menu = false;
+    }
+
+    fn start_row_freeze_drag(&mut self, pointer_y: Pixels) {
+        let axis_origin_y = pointer_y - px(self.active_layout().pinned_row_height());
+        self.selection_drag = None;
+        self.resize_drag = None;
+        self.freeze_drag = Some(FreezeDrag::Rows { axis_origin_y });
+        self.show_summary_menu = false;
+    }
+
+    fn start_row_freeze_drag_from_zero(&mut self, pointer_y: Pixels) {
+        self.selection_drag = None;
+        self.resize_drag = None;
+        self.freeze_drag = Some(FreezeDrag::Rows {
+            axis_origin_y: pointer_y,
+        });
+        self.show_summary_menu = false;
+    }
+
+    fn drag_freeze(&mut self, position: Point<Pixels>) -> bool {
+        let Some(freeze_drag) = self.freeze_drag else {
+            return false;
+        };
+
+        match freeze_drag {
+            FreezeDrag::Columns { axis_origin_x } => {
+                let target = freeze_target_column(
+                    self.active_layout(),
+                    f32::from(position.x - axis_origin_x),
+                );
+                self.active_layout_mut().set_pinned_columns(target)
+            }
+            FreezeDrag::Rows { axis_origin_y } => {
+                let target =
+                    freeze_target_row(self.active_layout(), f32::from(position.y - axis_origin_y));
+                if self.active_layout_mut().set_pinned_rows(target) {
+                    self.body_list
+                        .reset(self.active_layout().scrollable_row_count());
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn end_freeze_drag(&mut self) {
+        self.freeze_drag = None;
     }
 
     fn resize_columns_for_drag(&self, col_ix: usize) -> Vec<usize> {
@@ -717,16 +918,18 @@ impl SpreadsheetViewer {
         }
 
         let scroll_top = self.body_list.logical_scroll_top();
-        px(self.active_layout().scroll_position_for_row_offset(
+        let layout = self.active_layout();
+        px(scrollable_scroll_position_for_list_offset(
+            layout,
             scroll_top.item_ix,
             f32::from(scroll_top.offset_in_item),
         ))
     }
 
     fn scroll_list_to_vertical_position(&self, list_state: &ListState, scroll_position: Pixels) {
-        let (item_ix, offset_in_item) = self
-            .active_layout()
-            .row_offset_for_scroll_position(f32::from(scroll_position));
+        let layout = self.active_layout();
+        let (item_ix, offset_in_item) =
+            list_offset_for_scrollable_scroll_position(layout, f32::from(scroll_position));
         list_state.scroll_to(ListOffset {
             item_ix,
             offset_in_item: px(offset_in_item),
@@ -783,6 +986,7 @@ impl Render for SpreadsheetViewer {
                 entity.update(cx, |viewer, _| {
                     viewer.selection_drag = None;
                     viewer.end_resize();
+                    viewer.end_freeze_drag();
                 });
             })
             .on_mouse_move({
@@ -793,7 +997,8 @@ impl Render for SpreadsheetViewer {
                     }
 
                     entity.update(cx, |viewer, cx| {
-                        if viewer.drag_resize(event.position) {
+                        if viewer.drag_resize(event.position) || viewer.drag_freeze(event.position)
+                        {
                             cx.notify();
                         }
                     });
@@ -806,7 +1011,7 @@ impl Render for SpreadsheetViewer {
                     .flex()
                     .h(px(HEADER_HEIGHT))
                     .flex_none()
-                    .child(corner_header(layout.row_header_width, cx.entity()))
+                    .child(corner_header(&layout, cx.entity()))
                     .child(column_header_pane(
                         &workbook,
                         sheet_ix,
@@ -837,6 +1042,7 @@ impl Render for SpreadsheetViewer {
                         &self.horizontal_scroll,
                         self.body_list.clone(),
                         &cx.entity(),
+                        window,
                     ))
                     .when(scrollbars.vertical, |element| {
                         element.child(vertical_scrollbar(self, cx))
@@ -849,6 +1055,15 @@ impl Render for SpreadsheetViewer {
                         .h(px(SCROLLBAR_SIZE))
                         .flex_none()
                         .child(div().w(px(layout.row_header_width)).h_full().flex_none())
+                        .when(layout.pinned_columns > 0, |element| {
+                            element.child(
+                                div()
+                                    .w(px(layout.pinned_column_width()))
+                                    .h_full()
+                                    .flex_none()
+                                    .bg(rgb(HEADER_BG)),
+                            )
+                        })
                         .child(horizontal_scrollbar(self, cx))
                         .when(scrollbars.vertical, |element| {
                             element.child(
@@ -875,10 +1090,14 @@ fn scrollbar_visibility_for_window_size(
     let body_height =
         (window_height - TITLE_BAR_HEIGHT - formula_height - HEADER_HEIGHT - FOOTER_HEIGHT)
             .max(0.0);
+    let pinned_width = layout.pinned_column_width();
+    let pinned_height = layout.pinned_row_height();
+    let scrollable_width = layout.scrollable_width();
+    let scrollable_height = layout.scrollable_height();
 
     let mut visibility = ScrollbarVisibility {
-        horizontal: layout.sheet_width > body_width,
-        vertical: layout.sheet_height() > body_height,
+        horizontal: scrollable_width > (body_width - pinned_width).max(0.0),
+        vertical: scrollable_height > (body_height - pinned_height).max(0.0),
     };
 
     for _ in 0..2 {
@@ -893,8 +1112,8 @@ fn scrollbar_visibility_for_window_size(
             body_height
         };
         let next = ScrollbarVisibility {
-            horizontal: layout.sheet_width > available_width,
-            vertical: layout.sheet_height() > available_height,
+            horizontal: scrollable_width > (available_width - pinned_width).max(0.0),
+            vertical: scrollable_height > (available_height - pinned_height).max(0.0),
         };
         if next == visibility {
             break;
@@ -949,26 +1168,64 @@ fn column_header_pane(
     let horizontal_scroll = horizontal_scroll.clone();
     let scroll_entity: Entity<SpreadsheetViewer> = (*entity).clone();
     let header_entity: Entity<SpreadsheetViewer> = (*entity).clone();
+    let freeze_entity: Entity<SpreadsheetViewer> = (*entity).clone();
+    let horizontal_offset = horizontal_scroll.offset().x;
+    let pinned_width = layout.pinned_column_width();
+    let scrollable_width = layout.scrollable_width();
 
-    restrict_scroll_to_axis(
-        div()
-            .id("column-header-scroll")
-            .flex_1()
-            .h_full()
-            .overflow_hidden()
-            .track_scroll(&horizontal_scroll)
-            .on_scroll_wheel(horizontal_scroll_handler(horizontal_scroll, scroll_entity))
-            .child(column_headers(
-                &workbook,
-                sheet_ix,
-                layout,
-                selection,
-                &header_entity,
-            )),
-    )
-    .into_any_element()
+    div()
+        .id("column-header")
+        .flex_1()
+        .h_full()
+        .flex()
+        .overflow_hidden()
+        .when(layout.pinned_columns > 0, |element| {
+            element.child(
+                div()
+                    .relative()
+                    .h_full()
+                    .w(px(pinned_width))
+                    .flex_none()
+                    .overflow_hidden()
+                    .child(column_headers_range(
+                        &workbook,
+                        sheet_ix,
+                        layout,
+                        selection,
+                        &header_entity,
+                        0,
+                        layout.pinned_columns,
+                    ))
+                    .child(vertical_freeze_line(freeze_entity.clone())),
+            )
+        })
+        .child(restrict_scroll_to_axis(
+            div()
+                .id("column-header-scroll")
+                .flex_1()
+                .h_full()
+                .overflow_hidden()
+                .track_scroll(&horizontal_scroll)
+                .on_scroll_wheel(horizontal_scroll_handler(horizontal_scroll, scroll_entity))
+                .child(
+                    column_headers_range(
+                        &workbook,
+                        sheet_ix,
+                        layout,
+                        selection,
+                        &header_entity,
+                        layout.pinned_columns,
+                        workbook.sheet(sheet_ix).col_count(),
+                    )
+                    .relative()
+                    .left(horizontal_offset)
+                    .w(px(scrollable_width)),
+                ),
+        ))
+        .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn body_pane(
     workbook: &Arc<WorkbookData>,
     sheet_ix: usize,
@@ -977,22 +1234,54 @@ fn body_pane(
     horizontal_scroll: &ScrollHandle,
     body_list: ListState,
     entity: &Entity<SpreadsheetViewer>,
+    window: &mut Window,
 ) -> AnyElement {
     let workbook = Arc::clone(workbook);
     let horizontal_scroll = horizontal_scroll.clone();
     let row_horizontal_scroll = horizontal_scroll.clone();
+    let pinned_horizontal_scroll = horizontal_scroll.clone();
     let scroll_entity: Entity<SpreadsheetViewer> = (*entity).clone();
     let list_entity: Entity<SpreadsheetViewer> = (*entity).clone();
+    let pinned_entity: Entity<SpreadsheetViewer> = (*entity).clone();
+    let pinned_rows_height = layout.pinned_row_height();
+    let pinned_rows = layout.pinned_rows;
 
     div()
         .id("sheet-body")
         .flex_1()
         .h_full()
+        .flex()
+        .flex_col()
         .overflow_hidden()
         .on_scroll_wheel(horizontal_scroll_handler(horizontal_scroll, scroll_entity))
+        .when(pinned_rows > 0, |element| {
+            let mut pinned = div()
+                .relative()
+                .w_full()
+                .h(px(pinned_rows_height))
+                .flex()
+                .flex_col()
+                .flex_none()
+                .overflow_hidden();
+
+            for row_ix in 0..pinned_rows {
+                pinned = pinned.child(render_body_row(
+                    workbook.sheet(sheet_ix),
+                    &layout,
+                    row_ix,
+                    pinned_horizontal_scroll.offset().x,
+                    selection,
+                    &pinned_entity,
+                    window,
+                ));
+            }
+
+            element.child(pinned.child(horizontal_freeze_line(pinned_entity.clone())))
+        })
         .child(
             list(body_list, move |row_ix, window, _| {
                 let row_entity = list_entity.clone();
+                let row_ix = layout.pinned_rows + row_ix;
                 render_body_row(
                     workbook.sheet(sheet_ix),
                     &layout,
@@ -1003,7 +1292,8 @@ fn body_pane(
                     window,
                 )
             })
-            .size_full(),
+            .size_full()
+            .flex_1(),
         )
         .into_any_element()
 }
@@ -1037,7 +1327,7 @@ fn horizontal_scrollbar(
     cx: &mut Context<'_, SpreadsheetViewer>,
 ) -> AnyElement {
     let handle = viewer.horizontal_scroll.clone();
-    let content_width = px(viewer.active_layout().sheet_width);
+    let content_width = px(viewer.active_layout().scrollable_width());
 
     scrollbar_track("horizontal-scrollbar-track")
         .flex_1()
@@ -1056,7 +1346,7 @@ fn vertical_scrollbar(
     cx: &mut Context<'_, SpreadsheetViewer>,
 ) -> AnyElement {
     let viewport_height = viewer.body_list.viewport_bounds().size.height;
-    let content_height = px(viewer.active_layout().sheet_height()).max(viewport_height);
+    let content_height = px(viewer.active_layout().scrollable_height()).max(viewport_height);
     let scroll_position = viewer.vertical_scroll_position();
 
     scrollbar_track("vertical-scrollbar-track")
@@ -1660,17 +1950,83 @@ fn render_body_row(
             selection.range.intersects_row(row_ix),
             entity,
         ))
-        .child(
-            div().flex_1().h(px(row_height)).overflow_hidden().child(
-                render_cells_row(sheet, layout, row_ix, row_height, selection, entity, window)
-                    .relative()
-                    .left(horizontal_offset),
-            ),
-        )
+        .child(render_cells_row_segments(
+            sheet,
+            layout,
+            row_ix,
+            row_height,
+            horizontal_offset,
+            selection,
+            entity,
+            window,
+        ))
         .into_any_element()
 }
 
-fn render_cells_row(
+#[allow(clippy::too_many_arguments)]
+fn render_cells_row_segments(
+    sheet: &SheetData,
+    layout: &SheetLayout,
+    row_ix: usize,
+    row_height: f32,
+    horizontal_offset: Pixels,
+    selection: Selection,
+    entity: &Entity<SpreadsheetViewer>,
+    window: &mut Window,
+) -> Div {
+    let pinned_width = layout.pinned_column_width();
+    let scrollable_width = layout.scrollable_width();
+    let freeze_entity: Entity<SpreadsheetViewer> = (*entity).clone();
+
+    div()
+        .flex_1()
+        .h(px(row_height))
+        .flex()
+        .overflow_hidden()
+        .when(layout.pinned_columns > 0, |element| {
+            element.child(
+                div()
+                    .relative()
+                    .h(px(row_height))
+                    .w(px(pinned_width))
+                    .flex_none()
+                    .overflow_hidden()
+                    .child(render_cells_row_range(
+                        sheet,
+                        layout,
+                        row_ix,
+                        row_height,
+                        selection,
+                        entity,
+                        window,
+                        0,
+                        layout.pinned_columns,
+                    ))
+                    .child(vertical_freeze_line(freeze_entity.clone())),
+            )
+        })
+        .child(
+            div().flex_1().h(px(row_height)).overflow_hidden().child(
+                render_cells_row_range(
+                    sheet,
+                    layout,
+                    row_ix,
+                    row_height,
+                    selection,
+                    entity,
+                    window,
+                    layout.pinned_columns,
+                    sheet.col_count(),
+                )
+                .relative()
+                .left(horizontal_offset)
+                .w(px(scrollable_width)),
+            ),
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_cells_row_range(
     sheet: &SheetData,
     layout: &SheetLayout,
     row_ix: usize,
@@ -1678,15 +2034,22 @@ fn render_cells_row(
     selection: Selection,
     entity: &Entity<SpreadsheetViewer>,
     window: &mut Window,
+    start_col: usize,
+    end_col: usize,
 ) -> Stateful<Div> {
+    let end_col = end_col.min(sheet.col_count());
+    let width = layout.columns_width(start_col, end_col);
     let mut row = div()
-        .id(("sheet-cells-row", row_ix))
+        .id((
+            "sheet-cells-row",
+            row_ix.saturating_mul(2) + usize::from(start_col > 0),
+        ))
         .flex()
         .relative()
         .h(px(row_height))
-        .w(px(layout.sheet_width));
+        .w(px(width));
 
-    let cells = (0..sheet.col_count())
+    let cells = (start_col..end_col)
         .map(|col_ix| {
             let data = sheet.cell_data(row_ix, col_ix);
             let (text, formula_fallback) = cell_display_text(&data);
@@ -1699,18 +2062,19 @@ fn render_cells_row(
             }
         })
         .collect::<Vec<_>>();
-    let overflow_widths = overflow_text_widths(&cells, layout);
+    let overflow_widths = overflow_text_widths_for_columns(&cells, layout, start_col);
 
     for (col_ix, row_cell) in cells.iter().enumerate() {
+        let sheet_col_ix = start_col + col_ix;
         row = row.child(cell(
             row_cell,
-            layout.column_width(col_ix),
+            layout.column_width(sheet_col_ix),
             row_height,
             CellRenderState {
-                coord: CellCoord::new(row_ix, col_ix),
-                selected: selection.contains(row_ix, col_ix),
-                selection_edges: selection.range.edge_sides(row_ix, col_ix),
-                active: selection.anchor == CellCoord::new(row_ix, col_ix),
+                coord: CellCoord::new(row_ix, sheet_col_ix),
+                selected: selection.contains(row_ix, sheet_col_ix),
+                selection_edges: selection.range.edge_sides(row_ix, sheet_col_ix),
+                active: selection.anchor == CellCoord::new(row_ix, sheet_col_ix),
             },
             overflow_widths[col_ix].is_none(),
             entity,
@@ -1719,33 +2083,45 @@ fn render_cells_row(
 
     let mut left = 0.0;
     for (col_ix, row_cell) in cells.iter().enumerate() {
+        let sheet_col_ix = start_col + col_ix;
         if let Some(width) = overflow_widths[col_ix] {
             let state = CellRenderState {
-                coord: CellCoord::new(row_ix, col_ix),
-                selected: selection.contains(row_ix, col_ix),
-                selection_edges: selection.range.edge_sides(row_ix, col_ix),
-                active: selection.anchor == CellCoord::new(row_ix, col_ix),
+                coord: CellCoord::new(row_ix, sheet_col_ix),
+                selected: selection.contains(row_ix, sheet_col_ix),
+                selection_edges: selection.range.edge_sides(row_ix, sheet_col_ix),
+                active: selection.anchor == CellCoord::new(row_ix, sheet_col_ix),
             };
             row = row.child(cell_text_overlay(
                 row_cell,
                 left,
-                layout.column_width(col_ix),
+                layout.column_width(sheet_col_ix),
                 width,
                 row_height,
                 state,
             ));
         }
-        left += layout.column_width(col_ix);
+        left += layout.column_width(sheet_col_ix);
     }
 
     row
 }
 
+#[cfg(test)]
 fn overflow_text_widths(cells: &[RowCell], layout: &SheetLayout) -> Vec<Option<f32>> {
+    overflow_text_widths_for_columns(cells, layout, 0)
+}
+
+fn overflow_text_widths_for_columns(
+    cells: &[RowCell],
+    layout: &SheetLayout,
+    start_col: usize,
+) -> Vec<Option<f32>> {
     let mut widths = vec![None; cells.len()];
 
     for col_ix in 0..cells.len() {
-        let cell_content_width = (layout.column_width(col_ix) - CELL_HORIZONTAL_PADDING).max(0.0);
+        let sheet_col_ix = start_col + col_ix;
+        let cell_content_width =
+            (layout.column_width(sheet_col_ix) - CELL_HORIZONTAL_PADDING).max(0.0);
         let cell = &cells[col_ix];
         if !matches!(cell.data.raw_value, CellRawValue::Text)
             || cell.formula_fallback
@@ -1765,7 +2141,11 @@ fn overflow_text_widths(cells: &[RowCell], layout: &SheetLayout) -> Vec<Option<f
             continue;
         }
 
-        widths[col_ix] = Some((col_ix..end_col_ix).map(|ix| layout.column_width(ix)).sum());
+        widths[col_ix] = Some(
+            (col_ix..end_col_ix)
+                .map(|ix| layout.column_width(start_col + ix))
+                .sum(),
+        );
     }
 
     widths
@@ -1810,11 +2190,14 @@ fn measure_cell_text_width(
         .fold(0.0, f32::max)
 }
 
-fn corner_header(width: f32, entity: Entity<SpreadsheetViewer>) -> Div {
+fn corner_header(layout: &SheetLayout, entity: Entity<SpreadsheetViewer>) -> Div {
+    let column_freeze_entity = entity.clone();
+    let row_freeze_entity = entity.clone();
     div()
-        .w(px(width))
+        .w(px(layout.row_header_width))
         .h(px(HEADER_HEIGHT))
         .flex_none()
+        .relative()
         .bg(rgb(HEADER_BG))
         .border_r_1()
         .border_b_1()
@@ -1826,19 +2209,79 @@ fn corner_header(width: f32, entity: Entity<SpreadsheetViewer>) -> Div {
                 }
             });
         })
+        .when(layout.pinned_columns == 0, |element| {
+            element.child(
+                div()
+                    .absolute()
+                    .right(px(0.0))
+                    .top(px(0.0))
+                    .w(px(FREEZE_HANDLE_HIT_SIZE))
+                    .h_full()
+                    .cursor(CursorStyle::ResizeColumn)
+                    .child(
+                        div()
+                            .absolute()
+                            .right(px(0.0))
+                            .top(px(0.0))
+                            .w(px(FREEZE_HANDLE_VISUAL_SIZE))
+                            .h_full()
+                            .bg(rgb(FREEZE_LINE_COLOR)),
+                    )
+                    .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                        column_freeze_entity.update(cx, |viewer, cx| {
+                            viewer.start_column_freeze_drag_from_zero(event.position.x);
+                            cx.notify();
+                        });
+                        cx.stop_propagation();
+                    }),
+            )
+        })
+        .when(layout.pinned_rows == 0, |element| {
+            element.child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .bottom(px(0.0))
+                    .w_full()
+                    .h(px(FREEZE_HANDLE_HIT_SIZE))
+                    .cursor(CursorStyle::ResizeRow)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(0.0))
+                            .bottom(px(0.0))
+                            .w_full()
+                            .h(px(FREEZE_HANDLE_VISUAL_SIZE))
+                            .bg(rgb(FREEZE_LINE_COLOR)),
+                    )
+                    .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+                        row_freeze_entity.update(cx, |viewer, cx| {
+                            viewer.start_row_freeze_drag_from_zero(event.position.y);
+                            cx.notify();
+                        });
+                        cx.stop_propagation();
+                    }),
+            )
+        })
 }
 
-fn column_headers(
+fn column_headers_range(
     workbook: &WorkbookData,
     sheet_ix: usize,
     layout: &SheetLayout,
     selection: Selection,
     entity: &Entity<SpreadsheetViewer>,
+    start_col: usize,
+    end_col: usize,
 ) -> Div {
     let sheet = workbook.sheet(sheet_ix);
-    let mut row = div().flex().h(px(HEADER_HEIGHT)).w(px(layout.sheet_width));
+    let end_col = end_col.min(sheet.col_count());
+    let mut row = div()
+        .flex()
+        .h(px(HEADER_HEIGHT))
+        .w(px(layout.columns_width(start_col, end_col)));
 
-    for col_ix in 0..sheet.col_count() {
+    for col_ix in start_col..end_col {
         row = row.child(column_header(
             column_name(col_ix),
             layout.column_width(col_ix),
@@ -1916,6 +2359,42 @@ fn column_header(
                     cx.notify();
                 }
             });
+        })
+}
+
+fn vertical_freeze_line(entity: Entity<SpreadsheetViewer>) -> Div {
+    div()
+        .absolute()
+        .right(px(-(FREEZE_LINE_SIZE / 2.0)))
+        .top(px(0.0))
+        .w(px(FREEZE_LINE_SIZE))
+        .h_full()
+        .bg(rgb(FREEZE_LINE_COLOR))
+        .cursor(CursorStyle::ResizeColumn)
+        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+            entity.update(cx, |viewer, cx| {
+                viewer.start_column_freeze_drag(event.position.x);
+                cx.notify();
+            });
+            cx.stop_propagation();
+        })
+}
+
+fn horizontal_freeze_line(entity: Entity<SpreadsheetViewer>) -> Div {
+    div()
+        .absolute()
+        .left(px(0.0))
+        .bottom(px(-(FREEZE_LINE_SIZE / 2.0)))
+        .w_full()
+        .h(px(FREEZE_LINE_SIZE))
+        .bg(rgb(FREEZE_LINE_COLOR))
+        .cursor(CursorStyle::ResizeRow)
+        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+            entity.update(cx, |viewer, cx| {
+                viewer.start_row_freeze_drag(event.position.y);
+                cx.notify();
+            });
+            cx.stop_propagation();
         })
 }
 
@@ -2352,6 +2831,8 @@ mod tests {
             rows: RowLayout::from_explicit_heights(vec![24.0, 30.0]),
             sheet_width: 220.0,
             row_header_width: MIN_ROW_HEADER_WIDTH,
+            pinned_rows: 0,
+            pinned_columns: 0,
         };
 
         layout.set_column_widths(&[(0, 140.0), (1, 1.0)]);
@@ -2370,6 +2851,78 @@ mod tests {
     }
 
     #[test]
+    fn sheet_layout_clamps_pinned_rows_and_columns_to_bounds() {
+        let mut layout = layout_with_columns(vec![50.0, 60.0]);
+        layout.rows = RowLayout::from_explicit_heights(vec![20.0, 30.0, 40.0]);
+
+        assert!(layout.set_pinned_columns(99));
+        assert!(layout.set_pinned_rows(99));
+
+        assert_eq!(layout.pinned_columns, 2);
+        assert_eq!(layout.pinned_rows, 3);
+        assert_float_eq(layout.pinned_column_width(), 110.0);
+        assert_float_eq(layout.pinned_row_height(), 90.0);
+        assert_float_eq(layout.scrollable_width(), 0.0);
+        assert_float_eq(layout.scrollable_height(), 0.0);
+    }
+
+    #[test]
+    fn freeze_targets_snap_to_nearest_column_and_row_boundary() {
+        let mut layout = layout_with_columns(vec![50.0, 100.0, 80.0]);
+        layout.rows = RowLayout::from_explicit_heights(vec![20.0, 30.0, 40.0]);
+
+        assert_eq!(freeze_target_column(&layout, -1.0), 0);
+        assert_eq!(freeze_target_column(&layout, 24.0), 0);
+        assert_eq!(freeze_target_column(&layout, 26.0), 1);
+        assert_eq!(freeze_target_column(&layout, 101.0), 2);
+        assert_eq!(freeze_target_column(&layout, 999.0), 3);
+
+        assert_eq!(freeze_target_row(&layout, 9.0), 0);
+        assert_eq!(freeze_target_row(&layout, 11.0), 1);
+        assert_eq!(freeze_target_row(&layout, 36.0), 2);
+        assert_eq!(freeze_target_row(&layout, 999.0), 3);
+    }
+
+    #[test]
+    fn vertical_scroll_mapping_ignores_pinned_rows() {
+        let mut layout = layout_with_columns(vec![100.0]);
+        layout.rows = RowLayout::from_explicit_heights(vec![20.0, 30.0, 40.0, 50.0]);
+        layout.set_pinned_rows(2);
+
+        assert_float_eq(
+            scrollable_scroll_position_for_list_offset(&layout, 0, 5.0),
+            5.0,
+        );
+        assert_float_eq(
+            scrollable_scroll_position_for_list_offset(&layout, 1, 7.0),
+            47.0,
+        );
+        assert_eq!(
+            list_offset_for_scrollable_scroll_position(&layout, 47.0),
+            (1, 7.0)
+        );
+    }
+
+    #[test]
+    fn scrollbar_visibility_uses_only_scrollable_panes() {
+        let mut layout = layout_with_columns(vec![60.0, 60.0, 60.0]);
+        layout.rows = RowLayout::from_explicit_heights(vec![30.0, 30.0, 30.0]);
+        layout.sheet_width = 180.0;
+        layout.set_pinned_columns(1);
+        layout.set_pinned_rows(1);
+
+        let visibility = scrollbar_visibility_for_window_size(
+            &layout,
+            FORMULA_BAR_HEIGHT,
+            layout.row_header_width + 130.0,
+            fixed_view_height() + 70.0,
+        );
+
+        assert!(visibility.horizontal);
+        assert!(visibility.vertical);
+    }
+
+    #[test]
     fn uniform_row_layout_maps_scroll_positions_without_offsets() {
         let mut layout = SheetLayout {
             column_widths: vec![100.0],
@@ -2379,6 +2932,8 @@ mod tests {
             }),
             sheet_width: 100.0,
             row_header_width: row_header_width(1_000_000),
+            pinned_rows: 0,
+            pinned_columns: 0,
         };
 
         assert_float_eq(layout.row_height(999_999), 24.0);
@@ -2562,6 +3117,8 @@ mod tests {
             rows: RowLayout::from_explicit_heights(vec![sheet_height]),
             sheet_width,
             row_header_width: MIN_ROW_HEADER_WIDTH,
+            pinned_rows: 0,
+            pinned_columns: 0,
         }
     }
 
@@ -2571,6 +3128,8 @@ mod tests {
             column_widths,
             rows: RowLayout::from_explicit_heights(vec![crate::workbook::DEFAULT_ROW_HEIGHT]),
             row_header_width: MIN_ROW_HEADER_WIDTH,
+            pinned_rows: 0,
+            pinned_columns: 0,
         }
     }
 

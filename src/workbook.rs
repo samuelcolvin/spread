@@ -25,6 +25,13 @@ pub(crate) struct WorkbookData {
 pub(crate) struct SheetData {
     name: String,
     source: Arc<dyn SheetSource>,
+    freeze: SheetFreeze,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct SheetFreeze {
+    pub(crate) rows: usize,
+    pub(crate) columns: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -249,6 +256,29 @@ impl SheetData {
         default_row_height: f32,
         row_height_mode: EagerRowHeightMode,
     ) -> Self {
+        Self::new_with_freeze(
+            sheet_name,
+            rows,
+            column_widths,
+            row_heights,
+            default_column_width,
+            default_row_height,
+            row_height_mode,
+            SheetFreeze::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_freeze(
+        sheet_name: Option<String>,
+        rows: Vec<Vec<CellData>>,
+        column_widths: Vec<f32>,
+        row_heights: Vec<f32>,
+        default_column_width: f32,
+        default_row_height: f32,
+        row_height_mode: EagerRowHeightMode,
+        freeze: SheetFreeze,
+    ) -> Self {
         let name = sheet_name.unwrap_or_else(|| "Sheet1".to_owned());
         let source = EagerSheetSource::new(
             rows,
@@ -262,6 +292,7 @@ impl SheetData {
         Self {
             name,
             source: Arc::new(source),
+            freeze,
         }
     }
 
@@ -269,9 +300,18 @@ impl SheetData {
         sheet_name: Option<String>,
         source: impl SheetSource + 'static,
     ) -> Self {
+        Self::from_source_with_freeze(sheet_name, source, SheetFreeze::default())
+    }
+
+    pub(crate) fn from_source_with_freeze(
+        sheet_name: Option<String>,
+        source: impl SheetSource + 'static,
+        freeze: SheetFreeze,
+    ) -> Self {
         Self {
             name: sheet_name.unwrap_or_else(|| "Sheet1".to_owned()),
             source: Arc::new(source),
+            freeze,
         }
     }
 
@@ -283,6 +323,10 @@ impl SheetData {
 
     pub(crate) fn row_layout(&self) -> SheetRowLayout {
         self.source.row_layout()
+    }
+
+    pub(crate) fn freeze(&self) -> SheetFreeze {
+        self.freeze
     }
 
     pub(crate) fn is_fully_loaded(&self) -> bool {
@@ -1078,13 +1122,15 @@ fn load_xlsx(path: &Path) -> Result<WorkbookData> {
             })
             .collect();
 
-        sheets.push(SheetData::new(
+        sheets.push(SheetData::new_with_freeze(
             Some(sheet_name.clone()),
             rows,
             sheet_metadata.column_widths,
             sheet_metadata.row_heights,
             sheet_metadata.default_column_width,
             sheet_metadata.default_row_height,
+            EagerRowHeightMode::Auto,
+            sheet_metadata.freeze,
         ));
     }
 
@@ -1435,6 +1481,7 @@ struct SheetMetadata {
     row_heights: Vec<f32>,
     default_column_width: f32,
     default_row_height: f32,
+    freeze: SheetFreeze,
 }
 
 impl Default for SheetMetadata {
@@ -1445,6 +1492,7 @@ impl Default for SheetMetadata {
             row_heights: Vec::new(),
             default_column_width: DEFAULT_COLUMN_WIDTH,
             default_row_height: DEFAULT_ROW_HEIGHT,
+            freeze: SheetFreeze::default(),
         }
     }
 }
@@ -1735,6 +1783,15 @@ fn read_sheet_metadata(
                     metadata.default_row_height = points_to_px(height);
                 }
             }
+            Event::Start(event) | Event::Empty(event)
+                if event.local_name().as_ref() == b"pane"
+                    && attr_string(&reader, &event, b"state")?.as_deref() == Some("frozen") =>
+            {
+                metadata.freeze = SheetFreeze {
+                    rows: attr_f32(&reader, &event, b"ySplit")?.map_or(0, frozen_split_to_count),
+                    columns: attr_f32(&reader, &event, b"xSplit")?.map_or(0, frozen_split_to_count),
+                };
+            }
             Event::Start(event) | Event::Empty(event) if event.local_name().as_ref() == b"col" => {
                 if let (Some(min), Some(max), Some(width)) = (
                     attr_usize(&reader, &event, b"min")?,
@@ -1784,6 +1841,11 @@ fn read_sheet_metadata(
     }
 
     Ok(metadata)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn frozen_split_to_count(split: f32) -> usize {
+    split.max(0.0).round() as usize
 }
 
 fn set_vec_value(values: &mut Vec<f32>, ix: usize, value: f32) {
@@ -2005,6 +2067,13 @@ mod tests {
         assert_eq!(workbook.cell(1, 0), "Ada");
         assert_eq!(workbook.cell(3, 0), "Linus");
         assert_eq!(workbook.cell(3, 1), "30");
+        assert_eq!(
+            workbook.sheet(0).freeze(),
+            SheetFreeze {
+                rows: 1,
+                columns: 0,
+            }
+        );
         assert_eq!(
             workbook.cell_data(3, 1).raw_value,
             CellRawValue::Number(30.0)
@@ -2295,6 +2364,38 @@ mod tests {
         assert!((sheet_metadata.column_widths[2] - excel_column_width_to_px(20.0)).abs() < 0.01);
         assert!((sheet_metadata.default_row_height - points_to_px(18.0)).abs() < 0.01);
         assert!((sheet_metadata.row_heights[3] - points_to_px(30.0)).abs() < 0.01);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn reads_xlsx_freeze_panes_from_metadata() {
+        let path = temp_file("spread-frozen.xlsx");
+        let styles_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <cellXfs count="1"><xf numFmtId="0"/></cellXfs>
+</styleSheet>"#;
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetViews>
+    <sheetView workbookViewId="0">
+      <pane xSplit="2" ySplit="3" topLeftCell="C4" activePane="bottomRight" state="frozen"/>
+    </sheetView>
+  </sheetViews>
+  <sheetData><row r="1"><c r="A1"/></row></sheetData>
+</worksheet>"#;
+        write_metadata_xlsx(&path, styles_xml, sheet_xml);
+
+        let metadata = XlsxMetadata::read(&path).unwrap();
+        let sheet_metadata = metadata.sheet_metadata("Sheet1");
+
+        assert_eq!(
+            sheet_metadata.freeze,
+            SheetFreeze {
+                rows: 3,
+                columns: 2,
+            }
+        );
 
         fs::remove_file(path).unwrap();
     }
