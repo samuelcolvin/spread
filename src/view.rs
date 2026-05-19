@@ -8,9 +8,9 @@ use std::{
 
 use gpui::{
     AnyElement, App, Bounds, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, FontWeight,
-    IntoElement, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render,
-    ScrollHandle, Stateful, TextRun, Window, actions, canvas, div, font, point, prelude::*, px,
-    rgb,
+    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Point, Render, ScrollHandle, Stateful, TextRun, Window, actions, canvas, div, font, point,
+    prelude::*, px, rgb,
 };
 
 use crate::{
@@ -68,6 +68,16 @@ pub(crate) struct SpreadsheetViewer {
     workbook: Arc<WorkbookData>,
     show_splash_after_close: Rc<Cell<bool>>,
     focus_handle: FocusHandle,
+    name_box_focus: FocusHandle,
+    /// `Some(buffer)` while the name box is being edited; `None` shows the
+    /// current selection address instead.
+    name_box_input: Option<String>,
+    /// When `true` the whole name box buffer is "selected", so the next typed
+    /// character replaces it (set by double-clicking the box).
+    name_box_select_all: bool,
+    /// Scrollable viewport `(width, height)` captured at the last render so
+    /// keyboard-driven navigation can center a target without re-laying-out.
+    scrollable_viewport: (f32, f32),
     active_sheet: usize,
     selection: Selection,
     selection_drag: Option<CellCoord>,
@@ -613,6 +623,7 @@ impl SpreadsheetViewer {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
+        let name_box_focus = cx.focus_handle();
 
         let layouts: Vec<SheetLayout> = (0..workbook.sheet_count())
             .map(|sheet_ix| SheetLayout::new(workbook.sheet(sheet_ix)))
@@ -622,6 +633,10 @@ impl SpreadsheetViewer {
             workbook,
             show_splash_after_close,
             focus_handle,
+            name_box_focus,
+            name_box_input: None,
+            name_box_select_all: false,
+            scrollable_viewport: (0.0, 0.0),
             active_sheet,
             selection: Selection::single(CellCoord::new(0, 0)),
             selection_drag: None,
@@ -676,6 +691,8 @@ impl SpreadsheetViewer {
 
         self.active_sheet = sheet_ix;
         self.selection = Selection::single(CellCoord::new(0, 0));
+        self.name_box_input = None;
+        self.name_box_select_all = false;
         self.selection_drag = None;
         self.show_summary_menu = false;
         self.horizontal_scroll.set_offset(point(px(0.0), px(0.0)));
@@ -757,6 +774,46 @@ impl SpreadsheetViewer {
         self.resize_drag = None;
         self.show_summary_menu = false;
         changed
+    }
+
+    fn apply_name_ref(&mut self, name_ref: NameRef) {
+        let center_on = match name_ref {
+            NameRef::Cell(coord) => {
+                self.select_cell(coord, false);
+                coord
+            }
+            NameRef::Column(col) => {
+                self.select_col(col, false);
+                CellCoord::new(0, col)
+            }
+            NameRef::Row(row) => {
+                self.select_row(row, false);
+                CellCoord::new(row, 0)
+            }
+        };
+        self.scroll_to_cell_centered(center_on);
+    }
+
+    fn scroll_to_cell_centered(&mut self, coord: CellCoord) {
+        let (viewport_width, viewport_height) = self.scrollable_viewport;
+        let (row_top, row_height, col_left, col_width) = {
+            let layout = self.active_layout();
+            (
+                layout.scrollable_row_top(coord.row),
+                layout.row_height(coord.row),
+                layout.columns_width(layout.pinned_columns, coord.col),
+                layout.column_width(coord.col),
+            )
+        };
+
+        let target_v = row_top - viewport_height / 2.0 + row_height / 2.0;
+        self.set_vertical_offset(target_v, viewport_height);
+
+        let target_h = (col_left - viewport_width / 2.0 + col_width / 2.0).max(0.0);
+        let max_x = self.horizontal_scroll.max_offset().width;
+        let next_x = px(target_h).min(max_x).max(px(0.0));
+        let current_y = self.horizontal_scroll.offset().y;
+        self.horizontal_scroll.set_offset(point(-next_x, current_y));
     }
 
     fn start_column_resize(&mut self, col_ix: usize, pointer_x: Pixels) {
@@ -997,6 +1054,16 @@ impl Render for SpreadsheetViewer {
             .vertical_offset
             .min(self.max_vertical_offset(scrollable_row_viewport_height));
         let vertical_offset = self.vertical_offset;
+        self.scrollable_viewport = (
+            scrollable_column_viewport_width,
+            scrollable_row_viewport_height,
+        );
+        // Clicking away from the name box blurs it; drop the edit buffer so the
+        // box falls back to showing the current selection address.
+        if self.name_box_input.is_some() && !self.name_box_focus.is_focused(window) {
+            self.name_box_input = None;
+            self.name_box_select_all = false;
+        }
         let entity = cx.entity();
         let focus_handle = self.focus_handle.clone();
 
@@ -1039,7 +1106,15 @@ impl Render for SpreadsheetViewer {
                 }
             })
             .child(title_bar(workbook.as_ref(), sheet_ix))
-            .child(formula_bar(workbook.sheet(sheet_ix), selection))
+            .child(formula_bar(
+                workbook.sheet(sheet_ix),
+                selection,
+                self.name_box_input.clone(),
+                self.name_box_select_all,
+                &self.name_box_focus,
+                &self.focus_handle,
+                &cx.entity(),
+            ))
             .child(
                 div()
                     .flex()
@@ -1250,26 +1325,20 @@ fn column_header_pane(
                 .track_scroll(&horizontal_scroll)
                 .on_scroll_wheel(horizontal_scroll_handler(horizontal_scroll, scroll_entity))
                 .child(
-                    div()
-                        .relative()
-                        .h_full()
-                        .w(px(scrollable_width))
-                        .child(
-                            column_headers_range(
-                                &workbook,
-                                sheet_ix,
-                                layout,
-                                selection,
-                                &header_entity,
-                                scrollable_columns.start,
-                                scrollable_columns.end,
-                            )
-                            .absolute()
-                            .top(px(0.0))
-                            .left(px(scrollable_columns_left)),
+                    div().relative().h_full().w(px(scrollable_width)).child(
+                        column_headers_range(
+                            &workbook,
+                            sheet_ix,
+                            layout,
+                            selection,
+                            &header_entity,
+                            scrollable_columns.start,
+                            scrollable_columns.end,
                         )
-                        .relative()
-                        .left(horizontal_offset),
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(scrollable_columns_left)),
+                    ),
                 ),
         ))
         .into_any_element()
@@ -1804,7 +1873,16 @@ fn scrollbar_position_to_scroll_offset(
     max_offset * (thumb_start / travel)
 }
 
-fn formula_bar(sheet: &SheetData, selection: Selection) -> Div {
+#[allow(clippy::too_many_arguments)]
+fn formula_bar(
+    sheet: &SheetData,
+    selection: Selection,
+    name_box_input: Option<String>,
+    name_box_select_all: bool,
+    name_box_focus: &FocusHandle,
+    grid_focus: &FocusHandle,
+    entity: &Entity<SpreadsheetViewer>,
+) -> Div {
     let formula_value = formula_bar_value(sheet, selection);
     let multiline = formula_value.contains('\n');
     let height = formula_bar_height(&formula_value);
@@ -1821,20 +1899,14 @@ fn formula_bar(sheet: &SheetData, selection: Selection) -> Div {
         .bg(rgb(HEADER_BG))
         .border_b_1()
         .border_color(rgb(GRID_COLOR))
-        .child(
-            div()
-                .w(px(72.0))
-                .h(px(24.0))
-                .mt(px(1.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(rgb(CELL_BG))
-                .border_1()
-                .border_color(rgb(GRID_COLOR))
-                .text_color(rgb(HEADER_TEXT))
-                .child(cell_address(selection.anchor)),
-        )
+        .child(name_box(
+            name_box_label(selection, sheet),
+            name_box_input,
+            name_box_select_all,
+            name_box_focus,
+            grid_focus,
+            entity,
+        ))
         .child(
             div()
                 .flex_1()
@@ -1852,6 +1924,213 @@ fn formula_bar(sheet: &SheetData, selection: Selection) -> Div {
                 .when(multiline, Styled::whitespace_normal)
                 .child(formula_value),
         )
+}
+
+fn name_box(
+    selection_label: String,
+    name_box_input: Option<String>,
+    name_box_select_all: bool,
+    name_box_focus: &FocusHandle,
+    grid_focus: &FocusHandle,
+    entity: &Entity<SpreadsheetViewer>,
+) -> Stateful<Div> {
+    let editing = name_box_input.is_some();
+    let select_all = editing && name_box_select_all;
+    let current_address = selection_label.clone();
+    let text = name_box_input.unwrap_or(selection_label);
+
+    let mut container = div()
+        .id("name-box")
+        .track_focus(name_box_focus)
+        .w(px(72.0))
+        .h(px(24.0))
+        .mt(px(1.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(CELL_BG))
+        .border_1()
+        .border_color(rgb(if editing {
+            SELECTION_BORDER
+        } else {
+            GRID_COLOR
+        }))
+        .text_color(rgb(HEADER_TEXT))
+        .cursor(CursorStyle::IBeam)
+        .on_mouse_down(MouseButton::Left, {
+            let name_box_focus = name_box_focus.clone();
+            let entity = entity.clone();
+            let current_address = current_address.clone();
+            move |event: &MouseDownEvent, window, cx| {
+                name_box_focus.focus(window);
+                let select_all = event.click_count >= 2;
+                entity.update(cx, |viewer, cx| {
+                    if select_all {
+                        viewer.name_box_input = Some(current_address.clone());
+                        viewer.name_box_select_all = true;
+                        cx.notify();
+                    } else if viewer.name_box_input.is_none() {
+                        viewer.name_box_input = Some(current_address.clone());
+                        viewer.name_box_select_all = false;
+                        cx.notify();
+                    } else if viewer.name_box_select_all {
+                        // Single click while the value is selected clears the
+                        // selection, like other text inputs.
+                        viewer.name_box_select_all = false;
+                        cx.notify();
+                    }
+                });
+                cx.stop_propagation();
+            }
+        })
+        .on_key_down({
+            let entity = entity.clone();
+            let grid_focus = grid_focus.clone();
+            move |event, window, cx| {
+                if name_box_key_down(&entity, event, cx) {
+                    grid_focus.focus(window);
+                }
+                cx.stop_propagation();
+            }
+        });
+
+    if select_all {
+        container = container.child(
+            div()
+                .px_1()
+                .bg(rgb(SELECTION_INNER_BORDER))
+                .text_color(rgb(CELL_TEXT))
+                .child(text),
+        );
+    } else {
+        container = container.child(text);
+        if editing {
+            container = container.child(div().w(px(1.0)).h(px(14.0)).bg(rgb(SELECTION_BORDER)));
+        }
+    }
+
+    container
+}
+
+/// Applies a name box keystroke. Returns `true` when the box should be closed
+/// and focus returned to the grid (Enter committed, or Escape cancelled).
+fn name_box_key_down(
+    entity: &Entity<SpreadsheetViewer>,
+    event: &KeyDownEvent,
+    cx: &mut App,
+) -> bool {
+    let key_char = event.keystroke.key_char.clone();
+    entity.update(cx, |viewer, cx| {
+        if viewer.name_box_input.is_none() {
+            return false;
+        }
+
+        match event.keystroke.key.as_str() {
+            "escape" => {
+                viewer.name_box_input = None;
+                cx.notify();
+                true
+            }
+            "enter" => {
+                let text = viewer.name_box_input.take().unwrap_or_default();
+                let sheet = viewer.active_sheet();
+                let parsed = parse_name_box_reference(&text, sheet.col_count(), sheet.row_count());
+                if let Some(name_ref) = parsed {
+                    viewer.apply_name_ref(name_ref);
+                }
+                cx.notify();
+                true
+            }
+            "backspace" => {
+                if let Some(buffer) = viewer.name_box_input.as_mut() {
+                    if viewer.name_box_select_all {
+                        buffer.clear();
+                    } else {
+                        buffer.pop();
+                    }
+                }
+                viewer.name_box_select_all = false;
+                cx.notify();
+                false
+            }
+            _ => {
+                if let Some(text) = key_char
+                    && !text.is_empty()
+                    && !text.chars().any(char::is_control)
+                    && let Some(buffer) = viewer.name_box_input.as_mut()
+                {
+                    if viewer.name_box_select_all {
+                        buffer.clear();
+                    }
+                    buffer.push_str(&text);
+                    viewer.name_box_select_all = false;
+                    cx.notify();
+                }
+                false
+            }
+        }
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NameRef {
+    Cell(CellCoord),
+    Column(usize),
+    Row(usize),
+}
+
+/// Parses a name box entry: `A` selects a column, `100` selects a row, and
+/// `B101` selects a cell. Out-of-range references clamp to the sheet bounds.
+fn parse_name_box_reference(input: &str, col_count: usize, row_count: usize) -> Option<NameRef> {
+    if col_count == 0 || row_count == 0 {
+        return None;
+    }
+
+    let trimmed = input.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+        return None;
+    }
+
+    let upper = trimmed.to_ascii_uppercase();
+    let letters: String = upper
+        .chars()
+        .take_while(char::is_ascii_alphabetic)
+        .collect();
+    let digits = &upper[letters.len()..];
+    if !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+
+    let col = if letters.is_empty() {
+        None
+    } else {
+        Some(column_index(&letters)?.min(col_count - 1))
+    };
+    let row = if digits.is_empty() {
+        None
+    } else {
+        let number: usize = digits.parse().ok()?;
+        Some(number.checked_sub(1)?.min(row_count - 1))
+    };
+
+    match (col, row) {
+        (Some(col), Some(row)) => Some(NameRef::Cell(CellCoord::new(row, col))),
+        (Some(col), None) => Some(NameRef::Column(col)),
+        (None, Some(row)) => Some(NameRef::Row(row)),
+        (None, None) => None,
+    }
+}
+
+/// Inverse of `column_name`: `A` -> 0, `Z` -> 25, `AA` -> 26. Returns `None`
+/// only if the bijective base-26 value overflows `usize`.
+fn column_index(letters: &str) -> Option<usize> {
+    let mut index: usize = 0;
+    for byte in letters.bytes() {
+        index = index
+            .checked_mul(26)?
+            .checked_add(usize::from(byte - b'A' + 1))?;
+    }
+    index.checked_sub(1)
 }
 
 fn formula_bar_height_for_sheet(sheet: &SheetData, selection: Selection) -> f32 {
@@ -2043,6 +2322,38 @@ fn display_summary_number(value: f64) -> String {
 
 fn cell_address(coord: CellCoord) -> String {
     format!("{}{}", column_name(coord.col), coord.row + 1)
+}
+
+/// Text shown in the name box for the current selection: just the column
+/// letter(s) when whole columns are selected, just the row number(s) when
+/// whole rows are selected, otherwise the anchor cell address.
+fn name_box_label(selection: Selection, sheet: &SheetData) -> String {
+    let max_row = sheet.row_count().saturating_sub(1);
+    let max_col = sheet.col_count().saturating_sub(1);
+    let range = selection.range.normalized();
+    let full_column = max_row > 0 && range.start.row == 0 && range.end.row == max_row;
+    let full_row = max_col > 0 && range.start.col == 0 && range.end.col == max_col;
+
+    if full_column && !full_row {
+        return if range.start.col == range.end.col {
+            column_name(range.start.col)
+        } else {
+            format!(
+                "{}:{}",
+                column_name(range.start.col),
+                column_name(range.end.col)
+            )
+        };
+    }
+    if full_row && !full_column {
+        return if range.start.row == range.end.row {
+            (range.start.row + 1).to_string()
+        } else {
+            format!("{}:{}", range.start.row + 1, range.end.row + 1)
+        };
+    }
+
+    cell_address(selection.anchor)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2924,6 +3235,49 @@ mod tests {
         assert_eq!(column_name(27), "AB");
         assert_eq!(column_name(701), "ZZ");
         assert_eq!(column_name(702), "AAA");
+    }
+
+    #[test]
+    fn column_index_inverts_column_name() {
+        assert_eq!(column_index("A"), Some(0));
+        assert_eq!(column_index("Z"), Some(25));
+        assert_eq!(column_index("AA"), Some(26));
+        assert_eq!(column_index("AB"), Some(27));
+        assert_eq!(column_index("ZZ"), Some(701));
+        assert_eq!(column_index("AAA"), Some(702));
+    }
+
+    #[test]
+    fn parses_column_row_and_cell_references() {
+        assert_eq!(
+            parse_name_box_reference("A", 10, 1000),
+            Some(NameRef::Column(0))
+        );
+        assert_eq!(
+            parse_name_box_reference("100", 10, 1000),
+            Some(NameRef::Row(99))
+        );
+        assert_eq!(
+            parse_name_box_reference(" b101 ", 10, 1000),
+            Some(NameRef::Cell(CellCoord::new(100, 1)))
+        );
+    }
+
+    #[test]
+    fn name_box_references_clamp_and_reject_bad_input() {
+        assert_eq!(
+            parse_name_box_reference("ZZ", 3, 5),
+            Some(NameRef::Column(2))
+        );
+        assert_eq!(
+            parse_name_box_reference("9999", 3, 5),
+            Some(NameRef::Row(4))
+        );
+        assert_eq!(parse_name_box_reference("", 3, 5), None);
+        assert_eq!(parse_name_box_reference("1A", 3, 5), None);
+        assert_eq!(parse_name_box_reference("A0", 3, 5), None);
+        assert_eq!(parse_name_box_reference("A1!", 3, 5), None);
+        assert_eq!(parse_name_box_reference("A1", 0, 0), None);
     }
 
     #[test]
