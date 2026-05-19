@@ -117,6 +117,8 @@ fn run(cli: &Cli) -> Result<()> {
     let open_urls_pending = Rc::clone(&pending_urls);
     let open_urls_show_splash_after_document_close = Rc::clone(&show_splash_after_document_close);
     let open_urls_splash_error = Rc::clone(&splash_error);
+    let open_urls_splash_loading = Rc::clone(&splash_loading);
+    let open_urls_splash_loading_filename = Rc::clone(&splash_loading_filename);
     let application = Application::new();
 
     application.on_open_urls(move |urls| {
@@ -128,10 +130,19 @@ fn run(cli: &Cli) -> Result<()> {
         let show_splash_after_document_close =
             Rc::clone(&open_urls_show_splash_after_document_close);
         let splash_error = Rc::clone(&open_urls_splash_error);
+        let splash_loading = Rc::clone(&open_urls_splash_loading);
+        let splash_loading_filename = Rc::clone(&open_urls_splash_loading_filename);
         executor
             .spawn(async move {
                 if let Err(error) = async_app.update(|cx| {
-                    open_urls(urls, &show_splash_after_document_close, &splash_error, cx)
+                    open_urls_async(
+                        urls,
+                        Rc::clone(&show_splash_after_document_close),
+                        Rc::clone(&splash_error),
+                        Rc::clone(&splash_loading),
+                        Rc::clone(&splash_loading_filename),
+                        cx,
+                    );
                 }) {
                     eprintln!("{error:#}");
                 }
@@ -143,17 +154,20 @@ fn run(cli: &Cli) -> Result<()> {
         set_app_icon();
         *async_app.borrow_mut() = Some(cx.to_async());
         let pending_urls = pending_urls.borrow_mut().drain(..).collect::<Vec<_>>();
-        let opened_pending_urls = if pending_urls.is_empty() {
-            0
-        } else {
-            open_urls(
-                pending_urls,
-                &show_splash_after_document_close,
-                &splash_error,
+        let pending_paths = paths_from_urls(pending_urls);
+        let has_pending_paths = !pending_paths.is_empty();
+        if has_pending_paths {
+            open_paths_async(
+                pending_paths,
+                Rc::clone(&show_splash_after_document_close),
+                Rc::clone(&splash_error),
+                Rc::clone(&splash_loading),
+                Rc::clone(&splash_loading_filename),
+                None,
                 cx,
-            )
-        };
-        let should_open_splash = initial_path.is_none() && opened_pending_urls == 0;
+            );
+        }
+        let should_open_splash = initial_path.is_none() && !has_pending_paths;
 
         if should_open_splash
             && let Err(error) = open_splash_window(
@@ -337,31 +351,6 @@ fn quit_spread(_: &QuitSpread, cx: &mut App) {
     cx.quit();
 }
 
-fn open_paths(
-    paths: Vec<PathBuf>,
-    show_splash_after_document_close: &Rc<Cell<bool>>,
-    splash_error: &Rc<RefCell<Option<String>>>,
-    cx: &mut App,
-) -> usize {
-    let mut opened = 0;
-    for path in paths {
-        if let Err(error) =
-            open_workbook_window(&path, None, Rc::clone(show_splash_after_document_close), cx)
-        {
-            eprintln!("{error:#}");
-            *splash_error.borrow_mut() = Some(error.to_string());
-            notify_splash_windows(cx);
-        } else {
-            opened += 1;
-        }
-    }
-    if opened > 0 {
-        splash_error.borrow_mut().take();
-        close_splash_windows(cx);
-    }
-    opened
-}
-
 fn open_paths_async(
     paths: Vec<PathBuf>,
     show_splash_after_document_close: Rc<Cell<bool>>,
@@ -439,6 +428,37 @@ fn open_paths_async(
     .detach();
 }
 
+fn open_urls_async(
+    urls: Vec<String>,
+    show_splash_after_document_close: Rc<Cell<bool>>,
+    splash_error: Rc<RefCell<Option<String>>>,
+    splash_loading: Rc<Cell<bool>>,
+    splash_loading_filename: Rc<RefCell<Option<String>>>,
+    cx: &mut App,
+) {
+    open_paths_async(
+        paths_from_urls(urls),
+        show_splash_after_document_close,
+        splash_error,
+        splash_loading,
+        splash_loading_filename,
+        None,
+        cx,
+    );
+}
+
+fn paths_from_urls(urls: Vec<String>) -> Vec<PathBuf> {
+    urls.into_iter()
+        .filter_map(|url| {
+            let path = file_url_to_path(&url);
+            if path.is_none() {
+                eprintln!("unsupported URL from platform: {url}");
+            }
+            path
+        })
+        .collect()
+}
+
 fn loading_filename(paths: &[PathBuf]) -> Option<String> {
     let path = paths.first()?;
     Some(
@@ -448,43 +468,13 @@ fn loading_filename(paths: &[PathBuf]) -> Option<String> {
     )
 }
 
-fn open_urls(
-    urls: Vec<String>,
-    show_splash_after_document_close: &Rc<Cell<bool>>,
-    splash_error: &Rc<RefCell<Option<String>>>,
-    cx: &mut App,
-) -> usize {
-    open_paths(
-        urls.into_iter()
-            .filter_map(|url| {
-                let path = file_url_to_path(&url);
-                if path.is_none() {
-                    eprintln!("unsupported URL from platform: {url}");
-                }
-                path
-            })
-            .collect(),
-        show_splash_after_document_close,
-        splash_error,
-        cx,
-    )
-}
-
-fn open_workbook_window(
-    path: &Path,
-    sheet: Option<&str>,
-    show_splash_after_document_close: Rc<Cell<bool>>,
-    cx: &mut App,
-) -> Result<()> {
-    let (workbook, sheet_ix) = load_workbook_for_window(path, sheet)?;
-    open_loaded_workbook_window(&workbook, sheet_ix, show_splash_after_document_close, cx)
-}
-
 fn load_workbook_for_window(
     path: &Path,
     sheet: Option<&str>,
 ) -> Result<(Arc<workbook::WorkbookData>, usize)> {
-    let workbook = Arc::new(load_workbook(path)?);
+    let workbook = load_workbook(path)?;
+    workbook.preload_initial_display_data()?;
+    let workbook = Arc::new(workbook);
     let sheet_ix = resolve_sheet(&workbook, sheet)?;
     Ok((workbook, sheet_ix))
 }

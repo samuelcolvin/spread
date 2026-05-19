@@ -55,6 +55,9 @@ pub(crate) trait SheetSource: Any + Send + Sync + std::fmt::Debug {
     fn row_layout(&self) -> SheetRowLayout;
     fn is_fully_loaded(&self) -> bool;
     fn supports_full_range_operations(&self) -> bool;
+    fn preload_initial_display_data(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl WorkbookData {
@@ -93,6 +96,14 @@ impl WorkbookData {
 
     pub(crate) fn sheet_names(&self) -> impl Iterator<Item = &str> {
         self.sheets.iter().map(SheetData::name)
+    }
+
+    pub(crate) fn preload_initial_display_data(&self) -> Result<()> {
+        for sheet in &self.sheets {
+            sheet.preload_initial_display_data()?;
+        }
+
+        Ok(())
     }
 
     pub(crate) fn sheet_index(&self, sheet: &str) -> Option<usize> {
@@ -343,6 +354,10 @@ impl SheetData {
 
     pub(crate) fn supports_full_range_operations(&self) -> bool {
         self.source.supports_full_range_operations()
+    }
+
+    fn preload_initial_display_data(&self) -> Result<()> {
+        self.source.preload_initial_display_data()
     }
 
     pub(crate) fn name(&self) -> &str {

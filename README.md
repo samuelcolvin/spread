@@ -2,7 +2,14 @@
 
 A simple, fast spreadsheet viewer written in Rust using [GPUI](https://www.gpui.rs/).
 
-It currently opens CSV, Parquet, and XLSX files for viewing only. Editing is intentionally not supported. CSV and Parquet are loaded lazily for large table browsing. XLSX rendering includes basic display formatting such as dates, currency, percentages, bold text, colors, and column/row dimensions.
+Editing is not supported.
+
+Features:
+
+- supports CSV, Parquet, and XLSX file formats
+- loads 30m row Parquet files in <1s
+- supports copy and paste to google docs or excel
+- displays display formatting such as dates, currency, percentages, bold text, colors, and column/row dimensions
 
 ## Usage
 

@@ -73,8 +73,6 @@ impl ParquetSheetSource {
             .with_context(|| format!("failed to read Parquet metadata from {}", path.display()))?;
         let metadata = reader_metadata.metadata();
         let schema = reader_metadata.schema().clone();
-        let data_row_count = usize::try_from(metadata.file_metadata().num_rows())
-            .with_context(|| format!("Parquet file {} has too many rows", path.display()))?;
         let mut row_groups = Vec::with_capacity(metadata.num_row_groups());
         let mut start_row = 0;
 
@@ -87,6 +85,12 @@ impl ParquetSheetSource {
             });
             start_row += row_count;
         }
+
+        // The file-level `num_rows` is unreliable: some writers leave it at 0,
+        // which would collapse the sheet height and hide the scrollbar. The
+        // summed row-group counts (already in the footer we loaded) are both
+        // authoritative and exactly the range we can actually read.
+        let data_row_count = start_row;
 
         Ok(Self {
             path: path.to_owned(),
@@ -114,6 +118,14 @@ impl ParquetSheetSource {
             .expect("Parquet cache poisoned")
             .get(data_row)
             .ok_or_else(|| anyhow!("Parquet row {data_row} was not loaded"))
+    }
+
+    fn load_first_data_window(&self) -> Result<()> {
+        if self.data_row_count == 0 {
+            return Ok(());
+        }
+
+        self.load_data_window(0)
     }
 
     fn load_data_window(&self, data_row: usize) -> Result<()> {
@@ -227,6 +239,10 @@ impl SheetSource for ParquetSheetSource {
 
     fn supports_full_range_operations(&self) -> bool {
         true
+    }
+
+    fn preload_initial_display_data(&self) -> Result<()> {
+        self.load_first_data_window()
     }
 }
 
