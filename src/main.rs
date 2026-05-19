@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock},
+    time::Duration,
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -100,10 +101,14 @@ fn run(cli: &Cli) -> Result<()> {
 
     let initial_path = cli.path.clone();
     let initial_sheet = cli.sheet.clone();
+    if let Some(path) = initial_path.as_deref() {
+        validate_workbook_extension(path)?;
+    }
     let async_app: Rc<RefCell<Option<AsyncApp>>> = Rc::new(RefCell::new(None));
     let pending_urls = Rc::new(RefCell::new(Vec::new()));
     let splash_error = Rc::new(RefCell::new(None));
     let splash_loading = Rc::new(Cell::new(false));
+    let splash_loading_filename = Rc::new(RefCell::new(None));
     // Set by a document window just before it closes itself via File > Close File.
     // The app shell consumes it in on_window_closed so opening the splash happens
     // after GPUI has actually removed the document window from its window list.
@@ -156,6 +161,7 @@ fn run(cli: &Cli) -> Result<()> {
                 Rc::clone(&show_splash_after_document_close),
                 Rc::clone(&splash_error),
                 Rc::clone(&splash_loading),
+                Rc::clone(&splash_loading_filename),
             )
         {
             eprintln!("{error:#}");
@@ -174,11 +180,13 @@ fn run(cli: &Cli) -> Result<()> {
             Rc::clone(&show_splash_after_document_close);
         let open_dialog_splash_error = Rc::clone(&splash_error);
         let open_dialog_splash_loading = Rc::clone(&splash_loading);
+        let open_dialog_splash_loading_filename = Rc::clone(&splash_loading_filename);
         cx.on_action(move |_: &OpenDocument, cx| {
             open_document_from_dialog(
                 Rc::clone(&open_dialog_show_splash_after_document_close),
                 Rc::clone(&open_dialog_splash_error),
                 Rc::clone(&open_dialog_splash_loading),
+                Rc::clone(&open_dialog_splash_loading_filename),
                 cx,
             );
         });
@@ -204,6 +212,9 @@ fn run(cli: &Cli) -> Result<()> {
 
         let closed_window_show_splash_after_document_close =
             Rc::clone(&show_splash_after_document_close);
+        let closed_window_splash_error = Rc::clone(&splash_error);
+        let closed_window_splash_loading = Rc::clone(&splash_loading);
+        let closed_window_splash_loading_filename = Rc::clone(&splash_loading_filename);
         cx.on_window_closed(move |cx| {
             if closed_window_show_splash_after_document_close.replace(false) {
                 // Close File removes the document window first. Only after GPUI has
@@ -214,8 +225,9 @@ fn run(cli: &Cli) -> Result<()> {
                     && let Err(error) = open_splash_window(
                         cx,
                         Rc::clone(&closed_window_show_splash_after_document_close),
-                        Rc::clone(&splash_error),
-                        Rc::clone(&splash_loading),
+                        Rc::clone(&closed_window_splash_error),
+                        Rc::clone(&closed_window_splash_loading),
+                        Rc::clone(&closed_window_splash_loading_filename),
                     )
                 {
                     eprintln!("{error:#}");
@@ -226,16 +238,29 @@ fn run(cli: &Cli) -> Result<()> {
         })
         .detach();
 
-        if let Some(path) = initial_path.as_ref()
-            && let Err(error) = open_workbook_window(
-                path,
-                initial_sheet.as_deref(),
-                Rc::clone(&show_splash_after_document_close),
+        if let Some(path) = initial_path.as_ref() {
+            splash_loading.set(true);
+            *splash_loading_filename.borrow_mut() = loading_filename(std::slice::from_ref(path));
+            if let Err(error) = open_splash_window(
                 cx,
-            )
-        {
-            eprintln!("{error:#}");
-            cx.quit();
+                Rc::clone(&show_splash_after_document_close),
+                Rc::clone(&splash_error),
+                Rc::clone(&splash_loading),
+                Rc::clone(&splash_loading_filename),
+            ) {
+                eprintln!("{error:#}");
+                cx.quit();
+                return;
+            }
+            open_paths_async(
+                vec![path.clone()],
+                Rc::clone(&show_splash_after_document_close),
+                Rc::clone(&splash_error),
+                Rc::clone(&splash_loading),
+                Rc::clone(&splash_loading_filename),
+                initial_sheet.clone(),
+                cx,
+            );
         }
 
         cx.activate(true);
@@ -275,6 +300,7 @@ fn open_document_from_dialog(
     show_splash_after_document_close: Rc<Cell<bool>>,
     splash_error: Rc<RefCell<Option<String>>>,
     splash_loading: Rc<Cell<bool>>,
+    splash_loading_filename: Rc<RefCell<Option<String>>>,
     cx: &mut App,
 ) {
     let paths = cx.prompt_for_paths(PathPromptOptions {
@@ -292,6 +318,8 @@ fn open_document_from_dialog(
                     Rc::clone(&show_splash_after_document_close),
                     Rc::clone(&splash_error),
                     Rc::clone(&splash_loading),
+                    Rc::clone(&splash_loading_filename),
+                    None,
                     cx,
                 );
             }) {
@@ -339,26 +367,47 @@ fn open_paths_async(
     show_splash_after_document_close: Rc<Cell<bool>>,
     splash_error: Rc<RefCell<Option<String>>>,
     splash_loading: Rc<Cell<bool>>,
+    splash_loading_filename: Rc<RefCell<Option<String>>>,
+    sheet: Option<String>,
     cx: &mut App,
 ) {
+    if paths.is_empty() {
+        return;
+    }
+
     splash_error.borrow_mut().take();
     splash_loading.set(true);
+    *splash_loading_filename.borrow_mut() = loading_filename(&paths);
+    if !has_splash_window(cx)
+        && let Err(error) = open_splash_window(
+            cx,
+            Rc::clone(&show_splash_after_document_close),
+            Rc::clone(&splash_error),
+            Rc::clone(&splash_loading),
+            Rc::clone(&splash_loading_filename),
+        )
+    {
+        eprintln!("{error:#}");
+    }
     notify_splash_windows(cx);
-
-    let load_task = cx.background_executor().spawn(async move {
-        paths
-            .into_iter()
-            .map(|path| {
-                let result = load_workbook_for_window(&path, None);
-                (path, result)
-            })
-            .collect::<Vec<_>>()
-    });
+    let background_executor = cx.background_executor().clone();
 
     cx.spawn(async move |cx| {
-        let loaded = load_task.await;
+        background_executor.timer(Duration::from_millis(50)).await;
+        let loaded = background_executor
+            .spawn(async move {
+                paths
+                    .into_iter()
+                    .map(|path| {
+                        let result = load_workbook_for_window(&path, sheet.as_deref());
+                        (path, result)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .await;
         if let Err(error) = cx.update(|cx| {
             splash_loading.set(false);
+            splash_loading_filename.borrow_mut().take();
             let mut opened = 0;
             for (path, result) in loaded {
                 match result.and_then(|(workbook, sheet_ix)| {
@@ -388,6 +437,15 @@ fn open_paths_async(
         }
     })
     .detach();
+}
+
+fn loading_filename(paths: &[PathBuf]) -> Option<String> {
+    let path = paths.first()?;
+    Some(
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .map_or_else(|| path.display().to_string(), str::to_owned),
+    )
 }
 
 fn open_urls(
@@ -476,6 +534,7 @@ fn open_splash_window(
     show_splash_after_document_close: Rc<Cell<bool>>,
     splash_error: Rc<RefCell<Option<String>>>,
     splash_loading: Rc<Cell<bool>>,
+    splash_loading_filename: Rc<RefCell<Option<String>>>,
 ) -> Result<()> {
     let bounds = Bounds::centered(None, size(px(SPLASH_WIDTH), px(SPLASH_HEIGHT)), cx);
     cx.open_window(
@@ -493,6 +552,7 @@ fn open_splash_window(
                 show_splash_after_document_close,
                 error: splash_error,
                 loading: splash_loading,
+                loading_filename: splash_loading_filename,
             })
         },
     )
@@ -536,6 +596,7 @@ struct SplashScreen {
     show_splash_after_document_close: Rc<Cell<bool>>,
     error: Rc<RefCell<Option<String>>>,
     loading: Rc<Cell<bool>>,
+    loading_filename: Rc<RefCell<Option<String>>>,
 }
 
 impl Render for SplashScreen {
@@ -543,6 +604,7 @@ impl Render for SplashScreen {
         let show_splash_after_document_close = Rc::clone(&self.show_splash_after_document_close);
         let error = self.error.borrow().clone();
         let loading = self.loading.get();
+        let loading_filename = self.loading_filename.borrow().clone();
 
         div()
             .id("splash-screen")
@@ -553,6 +615,7 @@ impl Render for SplashScreen {
                         Rc::clone(&view.show_splash_after_document_close),
                         Rc::clone(&view.error),
                         Rc::clone(&view.loading),
+                        Rc::clone(&view.loading_filename),
                         cx,
                     );
                 },
@@ -591,12 +654,15 @@ impl Render for SplashScreen {
                             .text_color(rgb(SPLASH_MUTED_TEXT))
                             .child(format!("Version {APP_VERSION}")),
                     )
-                    .child(open_button(
-                        show_splash_after_document_close,
-                        Rc::clone(&self.error),
-                        Rc::clone(&self.loading),
-                    ))
-                    .child(status_line(error, loading)),
+                    .when(!loading, |content| {
+                        content.child(open_button(
+                            show_splash_after_document_close,
+                            Rc::clone(&self.error),
+                            Rc::clone(&self.loading),
+                            Rc::clone(&self.loading_filename),
+                        ))
+                    })
+                    .child(status_line(error, loading, loading_filename)),
             )
     }
 }
@@ -615,6 +681,7 @@ fn open_button(
     show_splash_after_document_close: Rc<Cell<bool>>,
     splash_error: Rc<RefCell<Option<String>>>,
     splash_loading: Rc<Cell<bool>>,
+    splash_loading_filename: Rc<RefCell<Option<String>>>,
 ) -> Div {
     let loading = splash_loading.get();
     div()
@@ -638,13 +705,14 @@ fn open_button(
                 Rc::clone(&show_splash_after_document_close),
                 Rc::clone(&splash_error),
                 Rc::clone(&splash_loading),
+                Rc::clone(&splash_loading_filename),
                 cx,
             );
         })
-        .child(if loading { "Opening..." } else { "Open file" })
+        .child("Open file")
 }
 
-fn status_line(error: Option<String>, loading: bool) -> Div {
+fn status_line(error: Option<String>, loading: bool, loading_filename: Option<String>) -> Div {
     div()
         .h(px(18.0))
         .max_w(px(420.0))
@@ -655,7 +723,10 @@ fn status_line(error: Option<String>, loading: bool) -> Div {
             SPLASH_ERROR_TEXT
         }))
         .child(if loading {
-            "Loading workbook...".to_owned()
+            loading_filename.map_or_else(
+                || "Opening workbook…".to_owned(),
+                |filename| format!("Opening {filename}…"),
+            )
         } else {
             error.unwrap_or_default()
         })
@@ -704,6 +775,21 @@ fn validate_output_mode(cli: &Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_workbook_extension(path: &Path) -> Result<()> {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("csv" | "parquet" | "xlsx") => Ok(()),
+        Some(extension) => {
+            bail!("unsupported file extension '.{extension}'; expected .csv, .parquet, or .xlsx")
+        }
+        None => bail!("unsupported file without extension; expected .csv, .parquet, or .xlsx"),
+    }
 }
 
 fn required_path(cli: &Cli) -> Result<&Path> {
@@ -955,6 +1041,16 @@ mod tests {
         let cli = parse_args(["spread", "--sheet", "Summary"]).unwrap();
         let error = validate_output_mode(&cli).unwrap_err();
         assert!(error.to_string().contains("missing spreadsheet file path"));
+    }
+
+    #[test]
+    fn validates_gui_workbook_extension_before_loading() {
+        validate_workbook_extension(Path::new("book.csv")).unwrap();
+        validate_workbook_extension(Path::new("book.parquet")).unwrap();
+        validate_workbook_extension(Path::new("book.xlsx")).unwrap();
+
+        let error = validate_workbook_extension(Path::new("book.tsv")).unwrap_err();
+        assert!(error.to_string().contains("unsupported file extension"));
     }
 
     #[test]

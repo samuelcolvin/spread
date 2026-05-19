@@ -18,12 +18,12 @@ install: .cargo ## Install dependencies and set up pre-commit hooks
 install-app: .cargo macos-app ## Install the spread CLI and macOS app bundle
 	cargo install --path . --locked
 
-.PHONY: icons
-icons: ## Generate macOS app and document icons
-	scripts/generate_icons.sh
+.PHONY: macos-icons
+macos-icons: ## Generate macOS app and document icons
+	scripts/generate_macos_icons.sh
 
 .PHONY: macos-app
-macos-app: .cargo icons ## Build and install Spread.app for Finder integration
+macos-app: .cargo ## Build and install Spread.app for Finder integration
 	cargo build --release --locked
 	install -d "$(APP_DIR)/Contents/MacOS" "$(APP_DIR)/Contents/Resources"
 	install -m 755 target/release/spread "$(APP_DIR)/Contents/MacOS/spread"
