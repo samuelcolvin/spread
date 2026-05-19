@@ -58,6 +58,14 @@ pub(crate) trait SheetSource: Any + Send + Sync + std::fmt::Debug {
     fn preload_initial_display_data(&self) -> Result<()> {
         Ok(())
     }
+
+    /// Numeric summary over `range` using only data already resident in memory,
+    /// never triggering lazy loading. Returns `None` for always-loaded sources,
+    /// so callers fall back to the full scan. `selected_cells` is left at zero;
+    /// the caller fills it from the (cheap) range size.
+    fn loaded_numeric_summary(&self, _range: CellRange) -> Option<SelectionSummary> {
+        None
+    }
 }
 
 impl WorkbookData {
@@ -555,6 +563,15 @@ impl SheetData {
         };
 
         let range = range.normalized();
+        if !self.is_fully_loaded()
+            && let Some(loaded) = self.source.loaded_numeric_summary(range)
+        {
+            return SelectionSummary {
+                selected_cells: summary.selected_cells,
+                ..loaded
+            };
+        }
+
         for row_ix in range.start.row..=range.end.row {
             for col_ix in range.start.col..=range.end.col {
                 if let Some(value) = self.numeric_value(row_ix, col_ix) {

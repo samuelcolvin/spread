@@ -19,8 +19,8 @@ use parquet::arrow::arrow_reader::{
 };
 
 use crate::workbook::{
-    CellData, CellRawValue, CellStyle, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT, SheetData,
-    SheetFreeze, SheetRowLayout, SheetSource,
+    CellData, CellRange, CellRawValue, CellStyle, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT,
+    SelectionSummary, SheetData, SheetFreeze, SheetRowLayout, SheetSource,
 };
 
 const PARQUET_ROW_CACHE_CAPACITY: usize = 2_048;
@@ -243,6 +243,34 @@ impl SheetSource for ParquetSheetSource {
 
     fn preload_initial_display_data(&self) -> Result<()> {
         self.load_first_data_window()
+    }
+
+    fn loaded_numeric_summary(&self, range: CellRange) -> Option<SelectionSummary> {
+        let header_offset = usize::from(self.col_count() > 0);
+        let cache = self.cache.lock().expect("Parquet cache poisoned");
+        let mut summary = SelectionSummary::default();
+
+        for (&data_row, cells) in &cache.rows {
+            let sheet_row = data_row + header_offset;
+            if sheet_row < range.start.row
+                || sheet_row > range.end.row
+                || range.start.col >= cells.len()
+            {
+                continue;
+            }
+
+            let last_col = range.end.col.min(cells.len() - 1);
+            for cell in &cells[range.start.col..=last_col] {
+                if let CellRawValue::Number(value) = cell.raw_value {
+                    summary.numeric_cells += 1;
+                    summary.sum += value;
+                    summary.min = Some(summary.min.map_or(value, |min| min.min(value)));
+                    summary.max = Some(summary.max.map_or(value, |max| max.max(value)));
+                }
+            }
+        }
+
+        Some(summary)
     }
 }
 
