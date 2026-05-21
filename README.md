@@ -4,16 +4,20 @@ A simple, fast spreadsheet viewer written in Rust using [GPUI](https://www.gpui.
 
 Editing is not supported.
 
+> [!NOTE]
+> As with most things in 2026, the code here was almost entirely written by AI - using both Codex + GPT-5.5 and Claude Code + Opus 4.7 1M.
+
 ## Why
 
-I wanted a quick way to view spreadsheets locally, without the need to open a document in google sheets.
+I wanted a quick way to view spreadsheets locally, without the need to open a document in Google sheets.
 
 Features:
 
 - supports CSV, Parquet, and XLSX file formats
 - loads 30M row Parquet files in 100ms
-- supports copy and paste to google docs or excel
+- supports copy and paste to Google sheets or excel
 - displays formatting such as dates, currency, percentages, bold text, colors, and column/row dimensions
+- `--display xml` mode from the CLI to make it easy for LLMs to "view" spreadsheets
 
 <p align="center">
   <img src="./examples/construction-business-plan.png" alt="Spread UI Excel example" width="600"><br>

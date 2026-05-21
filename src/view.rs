@@ -395,6 +395,29 @@ impl SheetLayout {
         start..end
     }
 
+    /// Row range ending at the very last row, with enough rows above it to fill
+    /// the viewport (plus overscan). Used when scrolled to the bottom so the
+    /// final rows are anchored to the last row directly, sidestepping the f32
+    /// precision loss of huge absolute pixel offsets in million-row sheets.
+    fn scrollable_rows_anchored_to_bottom(&self, viewport_height: f32) -> Range<usize> {
+        let row_count = self.rows.row_count();
+        let first_scrollable_row = self.pinned_rows.min(row_count);
+        if first_scrollable_row >= row_count {
+            return first_scrollable_row..first_scrollable_row;
+        }
+
+        let mut start = row_count;
+        let mut filled = 0.0;
+        while start > first_scrollable_row && filled < viewport_height {
+            start -= 1;
+            filled += self.rows.row_height(start);
+        }
+        let start = start
+            .saturating_sub(ROW_RENDER_OVERSCAN)
+            .max(first_scrollable_row);
+        start..row_count
+    }
+
     /// Distance from the top of the scrollable region to the top of `row_ix`.
     fn scrollable_row_top(&self, row_ix: usize) -> f32 {
         (self.scroll_position_for_row_offset(row_ix, 0.0) - self.pinned_row_height()).max(0.0)
@@ -1454,11 +1477,26 @@ fn body_pane(
         -f32::from(horizontal_scroll.offset().x),
         scrollable_viewport_width,
     );
-    let scrollable_rows =
-        layout.visible_scrollable_row_range(vertical_offset, scrollable_viewport_height);
     let content_height = layout.scrollable_height();
-    let visible_top = layout.scrollable_row_top(scrollable_rows.start);
     let max_vertical_offset = (content_height - scrollable_viewport_height).max(0.0);
+
+    // When dragged to the bottom, anchor the rendered window to the last row
+    // rather than to a giant absolute pixel offset: in million-row sheets the
+    // offset and row tops are both ~10^9px f32 values whose difference loses
+    // enough precision to push the final rows off screen. A gap below the last
+    // row is acceptable; clipping the last row is not.
+    let at_bottom = max_vertical_offset > 0.0 && vertical_offset >= max_vertical_offset;
+    let scrollable_rows = if at_bottom {
+        layout.scrollable_rows_anchored_to_bottom(scrollable_viewport_height)
+    } else {
+        layout.visible_scrollable_row_range(vertical_offset, scrollable_viewport_height)
+    };
+    let render_top = if at_bottom {
+        let rendered_height = layout.rows_height(scrollable_rows.start, scrollable_rows.end);
+        (scrollable_viewport_height - rendered_height).min(0.0)
+    } else {
+        layout.scrollable_row_top(scrollable_rows.start) - vertical_offset
+    };
 
     // Place the rendered window at its true position minus the scroll offset.
     // Only the visible rows exist as elements; there is no full-height spacer
@@ -1467,7 +1505,7 @@ fn body_pane(
     let mut visible = div()
         .absolute()
         .left(px(0.0))
-        .top(px(visible_top - vertical_offset))
+        .top(px(render_top))
         .w_full()
         .flex()
         .flex_col();
@@ -3707,6 +3745,35 @@ mod tests {
             layout.visible_scrollable_row_range(0.0, 0.0),
             layout.pinned_rows..layout.pinned_rows
         );
+    }
+
+    #[test]
+    fn anchored_to_bottom_range_reaches_the_last_row_and_fills_the_viewport() {
+        let mut layout = layout_with_columns(vec![100.0]);
+        layout.rows = RowLayout::new(SheetRowLayout::Uniform {
+            row_count: 37_000_000,
+            height: 20.0,
+        });
+        layout.set_pinned_rows(1);
+
+        let viewport_height = 200.0;
+        let range = layout.scrollable_rows_anchored_to_bottom(viewport_height);
+
+        // Always ends exactly on the final row, so the last row is rendered.
+        assert_eq!(range.end, 37_000_000);
+        assert!(range.start >= layout.pinned_rows);
+        // Enough rows above the last to cover the viewport, with overscan.
+        assert!(layout.rows_height(range.start, range.end) >= viewport_height);
+        assert!(range.len() <= 10 + 2 * ROW_RENDER_OVERSCAN);
+    }
+
+    #[test]
+    fn anchored_to_bottom_range_handles_sheets_shorter_than_the_viewport() {
+        let mut layout = layout_with_columns(vec![100.0]);
+        layout.rows = RowLayout::from_explicit_heights(vec![20.0, 30.0, 40.0]);
+
+        let range = layout.scrollable_rows_anchored_to_bottom(1000.0);
+        assert_eq!(range, 0..3);
     }
 
     #[test]
