@@ -69,7 +69,7 @@
       <key>CFBundleTypeRole</key>
       <string>Viewer</string>
       <key>LSHandlerRank</key>
-      <string>Alternate</string>
+      <string>Owner</string>
       <key>CFBundleTypeExtensions</key>
       <array>
         <string>parquet</string>
@@ -80,13 +80,15 @@
       </array>
     </dict>
   </array>
-  <key>UTImportedTypeDeclarations</key>
+  <key>UTExportedTypeDeclarations</key>
   <array>
     <dict>
       <key>UTTypeIdentifier</key>
       <string>org.apache.parquet</string>
       <key>UTTypeDescription</key>
       <string>Apache Parquet</string>
+      <key>UTTypeIconFile</key>
+      <string>Spread.icns</string>
       <key>UTTypeConformsTo</key>
       <array>
         <string>public.data</string>
