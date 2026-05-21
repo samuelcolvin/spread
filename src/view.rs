@@ -2930,7 +2930,7 @@ fn corner_header(layout: &SheetLayout, entity: Entity<SpreadsheetViewer>) -> Div
                     .top(px(0.0))
                     .w(px(FREEZE_HANDLE_HIT_SIZE))
                     .h_full()
-                    .cursor(CursorStyle::ResizeColumn)
+                    .cursor(CursorStyle::OpenHand)
                     .child(
                         div()
                             .absolute()
@@ -2957,7 +2957,7 @@ fn corner_header(layout: &SheetLayout, entity: Entity<SpreadsheetViewer>) -> Div
                     .bottom(px(0.0))
                     .w_full()
                     .h(px(FREEZE_HANDLE_HIT_SIZE))
-                    .cursor(CursorStyle::ResizeRow)
+                    .cursor(CursorStyle::OpenHand)
                     .child(
                         div()
                             .absolute()
@@ -3083,7 +3083,7 @@ fn vertical_freeze_line(entity: Entity<SpreadsheetViewer>) -> Div {
         .w(px(FREEZE_LINE_SIZE))
         .h_full()
         .bg(rgb(FREEZE_LINE_COLOR))
-        .cursor(CursorStyle::ResizeColumn)
+        .cursor(CursorStyle::OpenHand)
         .on_mouse_down(MouseButton::Left, move |event, _, cx| {
             entity.update(cx, |viewer, cx| {
                 viewer.start_column_freeze_drag(event.position.x);
@@ -3101,7 +3101,7 @@ fn horizontal_freeze_line(entity: Entity<SpreadsheetViewer>) -> Div {
         .w_full()
         .h(px(FREEZE_LINE_SIZE))
         .bg(rgb(FREEZE_LINE_COLOR))
-        .cursor(CursorStyle::ResizeRow)
+        .cursor(CursorStyle::OpenHand)
         .on_mouse_down(MouseButton::Left, move |event, _, cx| {
             entity.update(cx, |viewer, cx| {
                 viewer.start_row_freeze_drag(event.position.y);
