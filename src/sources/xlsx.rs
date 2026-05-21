@@ -6,8 +6,9 @@ use quick_xml::{Reader as XmlReader, events::Event};
 use zip::ZipArchive;
 
 use crate::workbook::{
-    CellData, CellDisplayFormat, CellRawValue, CellStyle, DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT,
-    SheetData, SheetFreeze, WorkbookData, calculate_missing_formula_values, display_float,
+    CellCoord, CellData, CellDisplayFormat, CellRange, CellRawValue, CellStyle,
+    DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT, SheetData, SheetFreeze, SheetMerges, WorkbookData,
+    calculate_missing_formula_values, display_float,
 };
 
 pub(crate) fn load_xlsx(path: &Path) -> Result<WorkbookData> {
@@ -66,15 +67,18 @@ pub(crate) fn load_xlsx(path: &Path) -> Result<WorkbookData> {
             })
             .collect();
 
-        sheets.push(SheetData::from_eager_with_freeze(
-            Some(sheet_name.clone()),
-            rows,
-            sheet_metadata.column_widths,
-            sheet_metadata.row_heights,
-            sheet_metadata.default_column_width,
-            sheet_metadata.default_row_height,
-            sheet_metadata.freeze,
-        ));
+        sheets.push(
+            SheetData::from_eager_with_freeze(
+                Some(sheet_name.clone()),
+                rows,
+                sheet_metadata.column_widths,
+                sheet_metadata.row_heights,
+                sheet_metadata.default_column_width,
+                sheet_metadata.default_row_height,
+                sheet_metadata.freeze,
+            )
+            .with_merges(SheetMerges::from_ranges(sheet_metadata.merges)),
+        );
     }
 
     calculate_missing_formula_values(&mut sheets);
@@ -188,6 +192,7 @@ pub(crate) struct SheetMetadata {
     pub(crate) default_column_width: f32,
     pub(crate) default_row_height: f32,
     pub(crate) freeze: SheetFreeze,
+    pub(crate) merges: Vec<CellRange>,
 }
 
 impl Default for SheetMetadata {
@@ -199,6 +204,7 @@ impl Default for SheetMetadata {
             default_column_width: DEFAULT_COLUMN_WIDTH,
             default_row_height: DEFAULT_ROW_HEIGHT,
             freeze: SheetFreeze::default(),
+            merges: Vec::new(),
         }
     }
 }
@@ -541,12 +547,32 @@ fn read_sheet_metadata(
                     );
                 }
             }
+            Event::Start(event) | Event::Empty(event)
+                if event.local_name().as_ref() == b"mergeCell" =>
+            {
+                if let Some(reference) = attr_string(&reader, &event, b"ref")?
+                    && let Some(range) = parse_merge_ref(&reference)
+                {
+                    metadata.merges.push(range);
+                }
+            }
             Event::Eof => break,
             _ => {}
         }
     }
 
     Ok(metadata)
+}
+
+/// Parse an `A1:B2`-style merged-range reference into a [`CellRange`].
+fn parse_merge_ref(reference: &str) -> Option<CellRange> {
+    let (start, end) = reference.split_once(':')?;
+    let (start_row, start_col) = cell_ref_to_indices(start.trim())?;
+    let (end_row, end_col) = cell_ref_to_indices(end.trim())?;
+    Some(CellRange::new(
+        CellCoord::new(start_row, start_col),
+        CellCoord::new(end_row, end_col),
+    ))
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -662,4 +688,23 @@ fn attr_rgb(
 fn parse_argb_color(value: &str) -> Option<u32> {
     let rgb = if value.len() == 8 { &value[2..] } else { value };
     u32::from_str_radix(rgb, 16).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_merged_range_references() {
+        let range = parse_merge_ref("A1:I1").expect("valid ref");
+        assert_eq!(range.start, CellCoord::new(0, 0));
+        assert_eq!(range.end, CellCoord::new(0, 8));
+
+        let range = parse_merge_ref("B3:D6").expect("valid ref");
+        assert_eq!(range.start, CellCoord::new(2, 1));
+        assert_eq!(range.end, CellCoord::new(5, 3));
+
+        assert!(parse_merge_ref("A1").is_none());
+        assert!(parse_merge_ref("nonsense").is_none());
+    }
 }

@@ -16,7 +16,7 @@ use gpui::{
 use crate::{
     CloseFile,
     workbook::{
-        CellCoord, CellData, CellRange, CellRawValue, SelectionEdgeSides, SheetData,
+        CellCoord, CellData, CellRange, CellRawValue, SelectionEdgeSides, SheetData, SheetMerges,
         SheetRowLayout, WorkbookData,
     },
 };
@@ -156,11 +156,24 @@ struct CellRenderState {
     active: bool,
 }
 
+/// How a cell participates in a merged region.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MergeKind {
+    /// Not part of any merge.
+    None,
+    /// Top-left cell of a merge; carries the content.
+    Anchor,
+    /// Non-anchor cell hidden underneath a merge.
+    Covered,
+}
+
+#[derive(Clone)]
 struct RowCell {
     data: CellData,
     text: String,
     text_width: f32,
     formula_fallback: bool,
+    merge: MergeKind,
 }
 
 #[derive(Clone, Copy)]
@@ -189,6 +202,7 @@ struct SheetLayout {
     row_header_width: f32,
     pinned_rows: usize,
     pinned_columns: usize,
+    merges: SheetMerges,
 }
 
 #[derive(Clone)]
@@ -218,7 +232,41 @@ impl SheetLayout {
             row_header_width: row_header_width(sheet.row_count()),
             pinned_rows: sheet.freeze().rows.min(sheet.row_count()),
             pinned_columns: sheet.freeze().columns.min(sheet.col_count()),
+            merges: sheet.merges().clone(),
         }
+    }
+
+    /// The merge region anchored at `(row, col)`, if `(row, col)` is an anchor.
+    fn merge_anchor(&self, row: usize, col: usize) -> Option<CellRange> {
+        self.merges.anchor_at(row, col)
+    }
+
+    /// The anchor coord covering `(row, col)`, if `(row, col)` is covered.
+    fn merge_covered_anchor(&self, row: usize, col: usize) -> Option<CellCoord> {
+        self.merges.covered_anchor(row, col)
+    }
+
+    /// How `(row, col)` participates in a merge.
+    fn merge_kind(&self, row: usize, col: usize) -> MergeKind {
+        if self.merge_anchor(row, col).is_some() {
+            MergeKind::Anchor
+        } else if self.merge_covered_anchor(row, col).is_some() {
+            MergeKind::Covered
+        } else {
+            MergeKind::None
+        }
+    }
+
+    /// Pixel `(width, height)` covered by a merge region.
+    fn merged_size(&self, range: CellRange) -> (f32, f32) {
+        let range = range.normalized();
+        let width = (range.start.col..=range.end.col)
+            .map(|col| self.column_width(col))
+            .sum();
+        let height = (range.start.row..=range.end.row)
+            .map(|row| self.row_height(row))
+            .sum();
+        (width, height)
     }
 
     fn column_width(&self, col: usize) -> f32 {
@@ -700,7 +748,15 @@ impl SpreadsheetViewer {
         true
     }
 
+    /// Resolve a covered merge cell to its anchor; other coords pass through.
+    fn merge_anchor_coord(&self, coord: CellCoord) -> CellCoord {
+        self.active_layout()
+            .merge_covered_anchor(coord.row, coord.col)
+            .unwrap_or(coord)
+    }
+
     fn select_cell(&mut self, coord: CellCoord, extend: bool) -> bool {
+        let coord = self.merge_anchor_coord(coord);
         let next_selection = if extend {
             self.selection.extend_to(coord)
         } else {
@@ -715,6 +771,7 @@ impl SpreadsheetViewer {
     }
 
     fn drag_to_cell(&mut self, coord: CellCoord) -> bool {
+        let coord = self.merge_anchor_coord(coord);
         if let Some(anchor) = self.selection_drag {
             let next_selection = Selection::select_range(anchor, coord);
             if self.selection == next_selection && !self.show_summary_menu {
@@ -2410,9 +2467,21 @@ fn render_cells_row_segments(
     let pinned_width = layout.pinned_column_width();
     let scrollable_width = layout.scrollable_width();
     let freeze_entity: Entity<SpreadsheetViewer> = (*entity).clone();
+    let overlays = row_overlay_layer(
+        sheet,
+        layout,
+        row_ix,
+        row_height,
+        horizontal_offset,
+        &scrollable_columns,
+        selection,
+        entity,
+        window,
+    );
 
     div()
         .flex_1()
+        .relative()
         .h(px(row_height))
         .flex()
         .overflow_hidden()
@@ -2465,6 +2534,200 @@ fn render_cells_row_segments(
                     .left(horizontal_offset),
             ),
         )
+        .children(overlays)
+}
+
+/// Absolutely-positioned overlays drawn on top of both panes for `row_ix`:
+/// merged-cell anchors and text overflow that spills across the freeze line.
+#[allow(clippy::too_many_arguments)]
+fn row_overlay_layer(
+    sheet: &SheetData,
+    layout: &SheetLayout,
+    row_ix: usize,
+    row_height: f32,
+    horizontal_offset: Pixels,
+    scrollable_columns: &Range<usize>,
+    selection: Selection,
+    entity: &Entity<SpreadsheetViewer>,
+    window: &mut Window,
+) -> Vec<Div> {
+    let mut overlays: Vec<Div> = Vec::new();
+    let pinned_columns = layout.pinned_columns;
+    let pinned_width = layout.pinned_column_width();
+
+    // Absolute left edge of a column within the row-segments container.
+    let column_left = |col: usize| -> f32 {
+        if col < pinned_columns {
+            layout.columns_width(0, col)
+        } else {
+            pinned_width + f32::from(horizontal_offset) + layout.columns_width(pinned_columns, col)
+        }
+    };
+
+    let cell_state = |coord: CellCoord| CellRenderState {
+        coord,
+        selected: selection.contains(coord.row, coord.col),
+        selection_edges: selection.range.edge_sides(coord.row, coord.col),
+        active: selection.anchor == coord,
+    };
+
+    // Merged-cell anchors that begin on this row.
+    for &region in layout.merges.regions() {
+        let region = region.normalized();
+        let anchor = region.start;
+        if anchor.row != row_ix {
+            continue;
+        }
+        let visible = anchor.col < pinned_columns || scrollable_columns.contains(&anchor.col);
+        if !visible {
+            continue;
+        }
+        let anchor_cell =
+            build_row_cells(sheet, layout, row_ix, anchor.col, anchor.col + 1, window)
+                .into_iter()
+                .next();
+        let Some(anchor_cell) = anchor_cell else {
+            continue;
+        };
+        let (width, height) = layout.merged_size(region);
+        overlays.push(merge_overlay_cell(
+            &anchor_cell,
+            column_left(anchor.col),
+            width,
+            height,
+            cell_state(anchor),
+            entity,
+        ));
+    }
+
+    // Text overflow that escapes the pinned pane into the scrollable pane.
+    // Only meaningful when the scrollable pane has not scrolled past its first
+    // column, so the spilled-over columns are exactly those after the freeze.
+    if pinned_columns > 0 && scrollable_columns.start == pinned_columns {
+        let cells = build_row_cells(sheet, layout, row_ix, 0, scrollable_columns.end, window);
+        let widths = overflow_text_widths_for_columns(&cells, layout, 0);
+        for col_ix in 0..pinned_columns.min(cells.len()) {
+            let Some(width) = widths[col_ix] else {
+                continue;
+            };
+            let left = layout.columns_width(0, col_ix);
+            // Already fits inside the pinned pane: the in-pane overlay handles it.
+            if left + width <= pinned_width + 0.5 {
+                continue;
+            }
+            overlays.push(cell_text_overlay(
+                &cells[col_ix],
+                left,
+                layout.column_width(col_ix),
+                width,
+                row_height,
+                cell_state(CellCoord::new(row_ix, col_ix)),
+            ));
+        }
+    }
+
+    overlays
+}
+
+fn merge_overlay_cell(
+    row_cell: &RowCell,
+    left: f32,
+    width: f32,
+    height: f32,
+    state: CellRenderState,
+    entity: &Entity<SpreadsheetViewer>,
+) -> Div {
+    let select_entity: Entity<SpreadsheetViewer> = (*entity).clone();
+    let drag_entity = select_entity.clone();
+    let cell = &row_cell.data;
+    let multiline = cell.style.wrap_text || row_cell.text.contains('\n');
+    let text_color = if row_cell.formula_fallback {
+        FORMULA_FALLBACK_TEXT
+    } else {
+        cell.style.text_color.unwrap_or(CELL_TEXT)
+    };
+    let background = if state.active {
+        ACTIVE_CELL_BG
+    } else if state.selected {
+        SELECTED_CELL_BG
+    } else {
+        cell.style.background_color.unwrap_or(CELL_BG)
+    };
+
+    let mut element = div()
+        .absolute()
+        .left(px(left))
+        .top(px(0.0))
+        .w(px(width))
+        .h(px(height))
+        .flex()
+        .px_2()
+        .overflow_hidden()
+        .border_r_1()
+        .border_b_1()
+        .border_color(rgb(GRID_COLOR))
+        .bg(rgb(background))
+        .text_color(rgb(text_color));
+
+    element = if multiline {
+        element.items_start().whitespace_normal()
+    } else {
+        element.items_center().whitespace_nowrap()
+    };
+
+    if cell.style.bold {
+        element = element.font_weight(FontWeight::BOLD);
+    }
+
+    let mut element = element.child(row_cell.text.clone());
+
+    if state.active || state.selected {
+        element = element.child(selection_outline(state.selection_edges));
+    }
+
+    element
+        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+            select_entity.update(cx, |viewer, cx| {
+                if viewer.select_cell(state.coord, event.modifiers.shift) {
+                    cx.notify();
+                }
+            });
+        })
+        .on_mouse_move(move |event, _, cx| {
+            if !event.dragging() {
+                return;
+            }
+
+            drag_entity.update(cx, |viewer, cx| {
+                if viewer.drag_to_cell(state.coord) {
+                    cx.notify();
+                }
+            });
+        })
+}
+
+fn build_row_cells(
+    sheet: &SheetData,
+    layout: &SheetLayout,
+    row_ix: usize,
+    start_col: usize,
+    end_col: usize,
+    window: &mut Window,
+) -> Vec<RowCell> {
+    (start_col..end_col)
+        .map(|col_ix| {
+            let data = sheet.cell_data(row_ix, col_ix);
+            let (text, formula_fallback) = cell_display_text(&data);
+            let text_width = measure_cell_text_width(&data, &text, formula_fallback, window);
+            RowCell {
+                data,
+                text,
+                text_width,
+                formula_fallback,
+                merge: layout.merge_kind(row_ix, col_ix),
+            }
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2491,19 +2754,7 @@ fn render_cells_row_range(
         .h(px(row_height))
         .w(px(width));
 
-    let cells = (start_col..end_col)
-        .map(|col_ix| {
-            let data = sheet.cell_data(row_ix, col_ix);
-            let (text, formula_fallback) = cell_display_text(&data);
-            let text_width = measure_cell_text_width(&data, &text, formula_fallback, window);
-            RowCell {
-                data,
-                text,
-                text_width,
-                formula_fallback,
-            }
-        })
-        .collect::<Vec<_>>();
+    let cells = build_row_cells(sheet, layout, row_ix, start_col, end_col, window);
     let overflow_widths = overflow_text_widths_for_columns(&cells, layout, start_col);
 
     for (col_ix, row_cell) in cells.iter().enumerate() {
@@ -2569,13 +2820,18 @@ fn overflow_text_widths_for_columns(
             || cell.formula_fallback
             || cell.data.style.wrap_text
             || cell.text.is_empty()
+            || cell.merge != MergeKind::None
             || cell.text_width <= cell_content_width
         {
             continue;
         }
 
+        // Text only spills into genuinely empty, non-merged neighbours.
         let mut end_col_ix = col_ix + 1;
-        while end_col_ix < cells.len() && cells[end_col_ix].text.is_empty() {
+        while end_col_ix < cells.len()
+            && cells[end_col_ix].text.is_empty()
+            && cells[end_col_ix].merge == MergeKind::None
+        {
             end_col_ix += 1;
         }
 
@@ -2933,6 +3189,9 @@ fn cell(
     } else {
         GRID_COLOR
     };
+    // Merged cells (anchor or covered) are painted by the merge overlay layer;
+    // the base cell stays blank and borderless so the region looks unified.
+    let merged = row_cell.merge != MergeKind::None;
     let mut element = div()
         .w(px(width))
         .h(px(row_height))
@@ -2941,8 +3200,13 @@ fn cell(
         .px_2()
         .overflow_hidden()
         .relative()
-        .border_1()
-        .border_color(rgb(border_color))
+        .when(!merged, |element| {
+            element
+                .border_1()
+                .border_color(rgb(border_color))
+                .border_l_0()
+                .border_t_0()
+        })
         .bg(rgb(if state.active {
             ACTIVE_CELL_BG
         } else if state.selected {
@@ -2958,20 +3222,18 @@ fn cell(
         element.items_center().whitespace_nowrap()
     };
 
-    element = element.border_l_0().border_t_0();
-
     if cell.style.bold {
         element = element.font_weight(FontWeight::BOLD);
     }
 
     let drag_entity = entity.clone();
-    let mut element = if render_text {
+    let mut element = if render_text && !merged {
         element.child(cell_text.to_owned())
     } else {
         element
     };
 
-    if highlighted {
+    if highlighted && !merged {
         element = element.child(selection_outline(state.selection_edges));
     }
 
@@ -3318,6 +3580,7 @@ mod tests {
             row_header_width: MIN_ROW_HEADER_WIDTH,
             pinned_rows: 0,
             pinned_columns: 0,
+            merges: SheetMerges::default(),
         };
 
         layout.set_column_widths(&[(0, 140.0), (1, 1.0)]);
@@ -3448,6 +3711,7 @@ mod tests {
             row_header_width: row_header_width(1_000_000),
             pinned_rows: 0,
             pinned_columns: 0,
+            merges: SheetMerges::default(),
         };
 
         assert_float_eq(layout.row_height(999_999), 24.0);
@@ -3582,6 +3846,7 @@ mod tests {
                 text: "1234567890".to_owned(),
                 text_width: 100.0,
                 formula_fallback: false,
+                merge: MergeKind::None,
             },
             empty_row_cell(),
         ];
@@ -3589,6 +3854,32 @@ mod tests {
         let widths = overflow_text_widths(&cells, &layout);
 
         assert!(widths.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn text_does_not_overflow_into_a_merged_cell() {
+        let layout = layout_with_columns(vec![50.0, 60.0, 60.0]);
+        let cells = vec![
+            text_row_cell("a long piece of text that wants room"),
+            merged_row_cell(MergeKind::Covered),
+            empty_row_cell(),
+        ];
+
+        let widths = overflow_text_widths(&cells, &layout);
+
+        assert!(widths[0].is_none());
+    }
+
+    #[test]
+    fn a_merge_anchor_does_not_text_overflow() {
+        let layout = layout_with_columns(vec![50.0, 60.0]);
+        let mut anchor = text_row_cell("a long piece of text that wants room");
+        anchor.merge = MergeKind::Anchor;
+        let cells = vec![anchor, empty_row_cell()];
+
+        let widths = overflow_text_widths(&cells, &layout);
+
+        assert!(widths[0].is_none());
     }
 
     #[test]
@@ -3613,6 +3904,7 @@ mod tests {
             text: text.to_owned(),
             text_width: text.chars().count() as f32 * 7.0,
             formula_fallback: false,
+            merge: MergeKind::None,
         }
     }
 
@@ -3622,6 +3914,14 @@ mod tests {
             text: String::new(),
             text_width: 0.0,
             formula_fallback: false,
+            merge: MergeKind::None,
+        }
+    }
+
+    fn merged_row_cell(merge: MergeKind) -> RowCell {
+        RowCell {
+            merge,
+            ..empty_row_cell()
         }
     }
 
@@ -3633,6 +3933,7 @@ mod tests {
             row_header_width: MIN_ROW_HEADER_WIDTH,
             pinned_rows: 0,
             pinned_columns: 0,
+            merges: SheetMerges::default(),
         }
     }
 
@@ -3644,6 +3945,7 @@ mod tests {
             row_header_width: MIN_ROW_HEADER_WIDTH,
             pinned_rows: 0,
             pinned_columns: 0,
+            merges: SheetMerges::default(),
         }
     }
 

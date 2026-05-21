@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    collections::HashMap,
     fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
@@ -20,12 +21,71 @@ pub(crate) struct SheetData {
     name: String,
     source: Arc<dyn SheetSource>,
     freeze: SheetFreeze,
+    merges: SheetMerges,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct SheetFreeze {
     pub(crate) rows: usize,
     pub(crate) columns: usize,
+}
+
+/// Merged-cell regions for a sheet. The top-left cell of each region is the
+/// "anchor" that carries the content; the remaining cells are "covered".
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SheetMerges {
+    regions: Vec<CellRange>,
+    by_cell: HashMap<(usize, usize), usize>,
+}
+
+impl SheetMerges {
+    pub(crate) fn from_ranges(ranges: impl IntoIterator<Item = CellRange>) -> Self {
+        let mut regions: Vec<CellRange> = Vec::new();
+        let mut by_cell: HashMap<(usize, usize), usize> = HashMap::new();
+        for range in ranges {
+            let range = range.normalized();
+            // A 1x1 "merge" is meaningless; ignore it.
+            if range.start == range.end {
+                continue;
+            }
+            let ix = regions.len();
+            for row in range.start.row..=range.end.row {
+                for col in range.start.col..=range.end.col {
+                    // First region wins on the rare overlap.
+                    by_cell.entry((row, col)).or_insert(ix);
+                }
+            }
+            regions.push(range);
+        }
+        Self { regions, by_cell }
+    }
+
+    pub(crate) fn regions(&self) -> &[CellRange] {
+        &self.regions
+    }
+
+    /// The full region anchored at `(row, col)`, or `None` unless `(row, col)`
+    /// is a top-left anchor.
+    pub(crate) fn anchor_at(&self, row: usize, col: usize) -> Option<CellRange> {
+        let range = self.region_at(row, col)?;
+        (range.start.row == row && range.start.col == col).then_some(range)
+    }
+
+    /// The anchor coord covering `(row, col)`, or `None` unless `(row, col)`
+    /// is a non-anchor covered cell.
+    pub(crate) fn covered_anchor(&self, row: usize, col: usize) -> Option<CellCoord> {
+        let range = self.region_at(row, col)?;
+        if range.start.row == row && range.start.col == col {
+            None
+        } else {
+            Some(range.start)
+        }
+    }
+
+    /// Any merge region containing `(row, col)`, anchor or covered.
+    pub(crate) fn region_at(&self, row: usize, col: usize) -> Option<CellRange> {
+        self.by_cell.get(&(row, col)).map(|&ix| self.regions[ix])
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +366,7 @@ impl SheetData {
             name,
             source: Arc::new(source),
             freeze,
+            merges: SheetMerges::default(),
         }
     }
 
@@ -339,7 +400,18 @@ impl SheetData {
             name: sheet_name.unwrap_or_else(|| "Sheet1".to_owned()),
             source: Arc::new(source),
             freeze,
+            merges: SheetMerges::default(),
         }
+    }
+
+    /// Attach merged-cell regions (only xlsx supplies these).
+    pub(crate) fn with_merges(mut self, merges: SheetMerges) -> Self {
+        self.merges = merges;
+        self
+    }
+
+    pub(crate) fn merges(&self) -> &SheetMerges {
+        &self.merges
     }
 
     fn eager_source_mut(&mut self) -> Option<&mut EagerSheetSource> {
@@ -1386,6 +1458,27 @@ fn column_name(mut index: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sheet_merges_resolve_anchors_and_covered_cells() {
+        let merges = SheetMerges::from_ranges([
+            CellRange::new(CellCoord::new(0, 0), CellCoord::new(0, 2)),
+            CellRange::new(CellCoord::new(2, 1), CellCoord::new(4, 1)),
+            // Degenerate 1x1 ranges are dropped.
+            CellRange::single(CellCoord::new(9, 9)),
+        ]);
+
+        assert_eq!(merges.regions().len(), 2);
+        assert!(merges.anchor_at(0, 0).is_some());
+        assert!(merges.anchor_at(0, 1).is_none());
+        assert_eq!(merges.covered_anchor(0, 2), Some(CellCoord::new(0, 0)));
+        assert_eq!(merges.covered_anchor(0, 0), None);
+        assert_eq!(merges.covered_anchor(3, 1), Some(CellCoord::new(2, 1)));
+        assert!(merges.region_at(4, 1).is_some());
+        assert!(merges.region_at(5, 5).is_none());
+        assert!(merges.anchor_at(9, 9).is_none());
+    }
+
     use arrow_array::{BooleanArray, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
     use calamine::Data;
