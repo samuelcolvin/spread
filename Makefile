@@ -9,14 +9,17 @@ LSREGISTER ?= /System/Library/Frameworks/CoreServices.framework/Frameworks/Launc
 .cargo: ## Check that cargo is installed
 	@cargo --version || echo 'Please install cargo: https://github.com/rust-lang/cargo'
 
-.PHONY: install
-install: .cargo ## Install dependencies and set up pre-commit hooks
+.PHONY: install-dev
+install-dev: .cargo ## Install dependencies and set up pre-commit hooks
 	cargo build
 	uvx prek install --install-hooks
 
-.PHONY: install-app
-install-app: .cargo macos-app ## Install the spread CLI and macOS app bundle
+.PHONY: install-cli
+install-cli: .cargo ## Install the spread CLI
 	cargo install --path . --locked
+
+.PHONY: install-macos
+install-macos: install-cli macos-app ## Install the spread CLI and macOS app bundle
 
 .PHONY: macos-icons
 macos-icons: ## Generate macOS app and document icons

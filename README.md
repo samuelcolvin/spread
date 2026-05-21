@@ -4,20 +4,36 @@ A simple, fast spreadsheet viewer written in Rust using [GPUI](https://www.gpui.
 
 Editing is not supported.
 
+## Why
+
+I wanted a quick way to view spreadsheets locally, without the need to open a document in google sheets.
+
 Features:
 
 - supports CSV, Parquet, and XLSX file formats
-- loads 30m row Parquet files in <1s
+- loads 30M row Parquet files in 100ms
 - supports copy and paste to google docs or excel
-- displays display formatting such as dates, currency, percentages, bold text, colors, and column/row dimensions
+- displays formatting such as dates, currency, percentages, bold text, colors, and column/row dimensions
+
+<p align="center">
+  <img src="./examples/construction-business-plan.png" alt="Spread UI Excel example" width="600"><br>
+  <em>Example of rendering xlsx file</em>
+</p>
+
+<p align="center">
+  <img src="./examples/parquet.png" alt="Spread UI Parquet example" width="600"><br>
+  <em>Example of rendering large Parquet file</em>
+</p>
 
 ## Usage
 
 Install the binary locally:
 
 ```sh
-make install-app
+make install-macos
 ```
+
+(If you're not on macOS, your mileage may vary, try `make install-cli` instead.)
 
 On macOS, this also installs `Spread.app` to `~/Applications`, registers it with Finder, and sets it as the default app for `.xlsx`, `.csv`, and `.parquet` when [`duti`](https://github.com/moretension/duti) is installed. Without `duti`, use Finder's Get Info panel to choose Spread and click "Change All...".
 

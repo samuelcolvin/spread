@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     rc::Rc,
     sync::{Arc, LazyLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -364,6 +364,7 @@ fn open_paths_async(
         return;
     }
 
+    let started = Instant::now();
     splash_error.borrow_mut().take();
     splash_loading.set(true);
     *splash_loading_filename.borrow_mut() = loading_filename(&paths);
@@ -403,14 +404,18 @@ fn open_paths_async(
                     open_loaded_workbook_window(
                         &workbook,
                         sheet_ix,
+                        started,
                         Rc::clone(&show_splash_after_document_close),
                         cx,
                     )
                 }) {
                     Ok(()) => opened += 1,
                     Err(error) => {
-                        eprintln!("{error:#}");
-                        *splash_error.borrow_mut() = Some(format!("{}: {error}", path.display()));
+                        // The splash screen surfaces this message; mirror it to
+                        // stderr so the failure is visible without the GUI too.
+                        let message = format!("{}: {error:#}", path.display());
+                        eprintln!("{message}");
+                        *splash_error.borrow_mut() = Some(message);
                     }
                 }
             }
@@ -482,6 +487,7 @@ fn load_workbook_for_window(
 fn open_loaded_workbook_window(
     workbook: &Arc<workbook::WorkbookData>,
     sheet_ix: usize,
+    load_started: Instant,
     show_splash_after_document_close: Rc<Cell<bool>>,
     cx: &mut App,
 ) -> Result<()> {
@@ -506,6 +512,7 @@ fn open_loaded_workbook_window(
                         Arc::clone(&workbook),
                         sheet_ix,
                         Rc::clone(&show_splash_after_document_close),
+                        load_started,
                         window,
                         cx,
                     )

@@ -106,6 +106,9 @@ pub(crate) struct SpreadsheetViewer {
     resize_drag: Option<ResizeDrag>,
     freeze_drag: Option<FreezeDrag>,
     layouts: Vec<SheetLayout>,
+    /// When the document open began; consumed on the first render to log the
+    /// total load-to-render time, then cleared so it only logs once.
+    load_started: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -680,6 +683,7 @@ impl SpreadsheetViewer {
         workbook: Arc<WorkbookData>,
         active_sheet: usize,
         show_splash_after_close: Rc<Cell<bool>>,
+        load_started: Instant,
         window: &mut Window,
         cx: &mut Context<'_, Self>,
     ) -> Self {
@@ -711,6 +715,7 @@ impl SpreadsheetViewer {
             resize_drag: None,
             freeze_drag: None,
             layouts,
+            load_started: Some(load_started),
         }
     }
 
@@ -1080,6 +1085,13 @@ impl Focusable for SpreadsheetViewer {
 
 impl Render for SpreadsheetViewer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) -> impl IntoElement {
+        if let Some(started) = self.load_started.take() {
+            eprintln!(
+                "loaded {} in {:?}",
+                self.workbook.display_name(),
+                started.elapsed()
+            );
+        }
         let workbook = Arc::clone(&self.workbook);
         let sheet_ix = self.active_sheet;
         let selection = self.selection;
