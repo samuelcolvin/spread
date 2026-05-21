@@ -80,5 +80,25 @@
       </array>
     </dict>
   </array>
+  <key>UTImportedTypeDeclarations</key>
+  <array>
+    <dict>
+      <key>UTTypeIdentifier</key>
+      <string>org.apache.parquet</string>
+      <key>UTTypeDescription</key>
+      <string>Apache Parquet</string>
+      <key>UTTypeConformsTo</key>
+      <array>
+        <string>public.data</string>
+      </array>
+      <key>UTTypeTagSpecification</key>
+      <dict>
+        <key>public.filename-extension</key>
+        <array>
+          <string>parquet</string>
+        </array>
+      </dict>
+    </dict>
+  </array>
 </dict>
 </plist>
