@@ -38,8 +38,11 @@ const FORMULA_FALLBACK_TEXT: u32 = 0x5f_63_68;
 const SELECTED_CELL_BG: u32 = 0xe8_f0_fe;
 const ACTIVE_TAB_BG: u32 = 0xff_ff_ff;
 const HOVER_CELL_BG: u32 = 0xee_f2_f7;
-const ACTIVE_CELL_BG: u32 = 0xd2_e3_fc;
 const SELECTION_BORDER: u32 = 0x1a_73_e8;
+/// Weight (out of 256) of the selection blue blended over a cell's real
+/// background, so zebra striping and fills stay visible under the highlight
+/// (matching Sheets) instead of being replaced by a flat color.
+const SELECTION_TINT_WEIGHT: u32 = 33;
 const SELECTION_INNER_BORDER: u32 = 0xa8_c7_fa;
 const TITLE_BAR_HEIGHT: f32 = 40.0;
 const FORMULA_BAR_HEIGHT: f32 = 36.0;
@@ -61,6 +64,17 @@ const ROW_RENDER_OVERSCAN: usize = 4;
 
 pub(crate) const WINDOW_WIDTH: f32 = 1100.0;
 pub(crate) const WINDOW_HEIGHT: f32 = 720.0;
+
+/// Blend the selection blue over `base` so the cell's real background still
+/// shows through, rather than being replaced by a flat highlight color.
+fn selection_tint(base: u32) -> u32 {
+    let channel = |shift: u32| {
+        let b = (base >> shift) & 0xff;
+        let o = (SELECTION_BORDER >> shift) & 0xff;
+        (b * (256 - SELECTION_TINT_WEIGHT) + o * SELECTION_TINT_WEIGHT) / 256
+    };
+    (channel(16) << 16) | (channel(8) << 8) | channel(0)
+}
 
 actions!(spreadsheet_viewer, [CopySelection]);
 
@@ -2646,12 +2660,13 @@ fn merge_overlay_cell(
     } else {
         cell.style.text_color.unwrap_or(CELL_TEXT)
     };
-    let background = if state.active {
-        ACTIVE_CELL_BG
-    } else if state.selected {
-        SELECTED_CELL_BG
-    } else {
-        cell.style.background_color.unwrap_or(CELL_BG)
+    let background = {
+        let base = cell.style.background_color.unwrap_or(CELL_BG);
+        if state.selected && !state.active {
+            selection_tint(base)
+        } else {
+            base
+        }
     };
 
     let mut element = div()
@@ -3014,7 +3029,7 @@ fn column_header(
         .whitespace_nowrap()
         .relative()
         .bg(rgb(if selected {
-            SELECTED_CELL_BG
+            selection_tint(HEADER_BG)
         } else {
             HEADER_BG
         }))
@@ -3119,7 +3134,7 @@ fn row_header(
         .whitespace_nowrap()
         .relative()
         .bg(rgb(if selected {
-            SELECTED_CELL_BG
+            selection_tint(HEADER_BG)
         } else {
             HEADER_BG
         }))
@@ -3207,12 +3222,13 @@ fn cell(
                 .border_l_0()
                 .border_t_0()
         })
-        .bg(rgb(if state.active {
-            ACTIVE_CELL_BG
-        } else if state.selected {
-            SELECTED_CELL_BG
-        } else {
-            cell.style.background_color.unwrap_or(CELL_BG)
+        .bg(rgb({
+            let base = cell.style.background_color.unwrap_or(CELL_BG);
+            if state.selected && !state.active {
+                selection_tint(base)
+            } else {
+                base
+            }
         }))
         .text_color(rgb(text_color));
 
@@ -3270,12 +3286,13 @@ fn cell_text_overlay(
     let mask_width = (row_cell.text_width + CELL_HORIZONTAL_PADDING).min(width);
     let source_mask_width = mask_width.min(source_width);
     let overflow_mask_width = (mask_width - source_width).max(0.0);
-    let source_background = if state.active {
-        ACTIVE_CELL_BG
-    } else if state.selected {
-        SELECTED_CELL_BG
-    } else {
-        cell.style.background_color.unwrap_or(CELL_BG)
+    let source_background = {
+        let base = cell.style.background_color.unwrap_or(CELL_BG);
+        if state.selected && !state.active {
+            selection_tint(base)
+        } else {
+            base
+        }
     };
     let text_color = if row_cell.formula_fallback {
         FORMULA_FALLBACK_TEXT
@@ -3880,6 +3897,19 @@ mod tests {
         let widths = overflow_text_widths(&cells, &layout);
 
         assert!(widths[0].is_none());
+    }
+
+    #[test]
+    fn selection_tint_blends_over_the_real_background() {
+        // Tinting nudges a color toward the selection blue without replacing it,
+        // so distinct backgrounds stay distinct under the highlight.
+        let white = selection_tint(CELL_BG);
+        let amber = selection_tint(0xff_e9_b0);
+        assert_ne!(white, CELL_BG);
+        assert_ne!(white, amber);
+        // White moves toward blue: the blue channel stays highest and brightness drops.
+        assert!(white & 0xff > (white >> 16) & 0xff);
+        assert!(white < CELL_BG);
     }
 
     #[test]
