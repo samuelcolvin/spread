@@ -39,25 +39,31 @@ pub(crate) fn load_xlsx(path: &Path) -> Result<WorkbookData> {
             })
             .unwrap_or_else(|_| Range::default());
         let sheet_metadata = xlsx_metadata.sheet_metadata(&sheet_name);
+        let (range_start_row, range_start_col) = range.start().unwrap_or((0, 0));
+        let range_start_row = range_start_row as usize;
+        let range_start_col = range_start_col as usize;
 
         let rows = range
             .rows()
             .enumerate()
             .map(|(row_ix, row)| {
+                let actual_row_ix = range_start_row + row_ix;
                 row.iter()
                     .enumerate()
                     .map(|(col_ix, cell)| {
-                        let style = sheet_metadata.cell_style(row_ix, col_ix);
+                        let actual_col_ix = range_start_col + col_ix;
+                        let style = sheet_metadata.cell_style(actual_row_ix, actual_col_ix);
                         let value = display_cell(cell, style.display_format.as_ref());
-                        let formula = formula_at(&formulas, row_ix, col_ix);
-                        let formula_value_was_uncached = value.is_empty()
+                        let formula = formula_at(&formulas, actual_row_ix, actual_col_ix);
+                        let raw_value = raw_value(cell);
+                        let formula_value_was_uncached = matches!(raw_value, CellRawValue::Empty)
                             && formula
                                 .as_deref()
                                 .is_some_and(|formula| !formula.is_empty());
                         CellData {
                             value,
                             formula,
-                            raw_value: raw_value(cell),
+                            raw_value,
                             style: style.visual_style.clone(),
                             display_format: style.display_format,
                             formula_value_was_uncached,
@@ -693,6 +699,8 @@ fn parse_argb_color(value: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{fs, io::Write as _};
+    use zip::{ZipWriter, write::SimpleFileOptions};
 
     #[test]
     fn parses_merged_range_references() {
@@ -706,5 +714,64 @@ mod tests {
 
         assert!(parse_merge_ref("A1").is_none());
         assert!(parse_merge_ref("nonsense").is_none());
+    }
+
+    #[test]
+    fn aligns_formula_ranges_with_non_zero_cell_range_start() {
+        let path =
+            std::env::temp_dir().join(format!("spread-offset-formula-{}.xlsx", std::process::id()));
+        write_offset_formula_xlsx(&path);
+
+        let workbook = load_xlsx(&path).expect("xlsx should load");
+        let formula_cell = workbook.cell_data(0, 0);
+        assert_eq!(formula_cell.value, "2");
+        assert_eq!(formula_cell.formula.as_deref(), Some("1+1"));
+        assert!(!formula_cell.formula_value_was_uncached);
+
+        let empty_cell = workbook.cell_data(1, 0);
+        assert_eq!(empty_cell.value, "");
+        assert_eq!(empty_cell.formula, None);
+        assert!(!empty_cell.formula_value_was_uncached);
+
+        fs::remove_file(path).ok();
+    }
+
+    fn write_offset_formula_xlsx(path: &Path) {
+        let file = File::create(path).expect("create test xlsx");
+        let mut zip = ZipWriter::new(file);
+        let options = SimpleFileOptions::default();
+
+        for (name, contents) in [
+            (
+                "[Content_Types].xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>"#,
+            ),
+            (
+                "_rels/.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/workbook.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets></workbook>"#,
+            ),
+            (
+                "xl/_rels/workbook.xml.rels",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><dimension ref="A2:A3"/><sheetData><row r="2"><c r="A2"><f>1+1</f><v>2</v></c></row><row r="3"><c r="A3"/></row></sheetData></worksheet>"#,
+            ),
+        ] {
+            zip.start_file(name, options).expect("start zip file");
+            zip.write_all(contents.as_bytes()).expect("write zip file");
+        }
+
+        zip.finish().expect("finish test xlsx");
     }
 }

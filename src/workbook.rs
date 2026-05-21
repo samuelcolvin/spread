@@ -588,7 +588,7 @@ impl SheetData {
         (0..self.row_count()).any(|row_ix| {
             (0..self.col_count()).any(|col_ix| {
                 let cell = self.cell_data(row_ix, col_ix);
-                cell.value.is_empty()
+                cell.formula_value_was_uncached
                     && cell
                         .formula
                         .as_deref()
@@ -1254,7 +1254,8 @@ fn build_formula_workbook(
                     .as_deref()
                     .filter(|formula| !formula.is_empty())
                     .filter(|_| {
-                        matches!(mode, FormulaWorkbookMode::AllFormulas) || cell.value.is_empty()
+                        matches!(mode, FormulaWorkbookMode::AllFormulas)
+                            || cell.formula_value_was_uncached
                     })
                 {
                     let formula = formula_with_equals(formula);
@@ -1700,11 +1701,13 @@ mod tests {
                 vec![vec![
                     CellData {
                         formula: Some("'Inputs'!A1+'Inputs'!B1".to_owned()),
+                        formula_value_was_uncached: true,
                         ..Default::default()
                     },
                     CellData {
                         formula: Some("A1*4".to_owned()),
                         display_format: Some(CellDisplayFormat::Currency { decimals: 0 }),
+                        formula_value_was_uncached: true,
                         ..Default::default()
                     },
                 ]],
