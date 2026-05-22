@@ -8,16 +8,16 @@ use std::{
 
 use gpui::{
     AnyElement, App, Bounds, Context, CursorStyle, Div, Entity, FocusHandle, Focusable, FontWeight,
-    IntoElement, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
-    Point, Render, ScrollHandle, Stateful, TextRun, Window, actions, canvas, div, font, point,
-    prelude::*, px, rgb,
+    IntoElement, KeyBinding, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, Render, ScrollHandle, Stateful, TextRun, Window, actions, canvas,
+    div, font, point, prelude::*, px, rgb,
 };
 
 use crate::{
     CloseFile,
     workbook::{
-        CellBorders, CellCoord, CellData, CellRange, CellRawValue, SelectionEdgeSides, SheetData,
-        SheetMerges, SheetRowLayout, WorkbookData,
+        CellBorders, CellCoord, CellData, CellRange, CellRawValue, SearchDirection,
+        SelectionEdgeSides, SheetData, SheetMerges, SheetRowLayout, WorkbookData, find_next_match,
     },
 };
 
@@ -76,7 +76,17 @@ fn selection_tint(base: u32) -> u32 {
     (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
-actions!(spreadsheet_viewer, [CopySelection]);
+actions!(spreadsheet_viewer, [CopySelection, OpenSearch]);
+
+/// Registers the key bindings that target the spreadsheet viewer's
+/// `key_context`. Called once from `main.rs` during app startup so the keymap
+/// lives next to the view code that handles the actions.
+pub(crate) fn bind_viewer_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("cmd-c", CopySelection, Some("SpreadsheetViewer")),
+        KeyBinding::new("cmd-f", OpenSearch, Some("SpreadsheetViewer")),
+    ]);
+}
 
 pub(crate) struct SpreadsheetViewer {
     workbook: Arc<WorkbookData>,
@@ -109,7 +119,44 @@ pub(crate) struct SpreadsheetViewer {
     /// When the document open began; consumed on the first render to log the
     /// total load-to-render time, then cleared so it only logs once.
     load_started: Option<Instant>,
+    /// `Some` while the find bar is open; `None` when hidden. Holds the live
+    /// query, focus handle, and a sequence counter used to discard stale
+    /// background-search results.
+    search: Option<SearchState>,
 }
+
+// The flags below are independent state, not modes of a single state machine,
+// so flattening them into one enum would obscure rather than clarify.
+#[allow(clippy::struct_excessive_bools)]
+struct SearchState {
+    /// What the user is currently typing.
+    query: String,
+    /// Lowercased query of the most recently *completed* search; lets the next
+    /// Enter advance from `current_match` instead of restarting at the
+    /// selection anchor.
+    last_completed_query: Option<String>,
+    /// The coord of the most recent match, or `None` if no completed search
+    /// has matched yet.
+    current_match: Option<CellCoord>,
+    /// True iff the last completed search returned no match.
+    no_results: bool,
+    /// True while a background task is in flight, so the bar can show a status.
+    in_flight: bool,
+    /// Bumped on every spawn. The main-thread completion handler compares it
+    /// against the still-current state and drops the result if it's stale.
+    request_seq: u64,
+    /// Focus handle for the find bar's input.
+    focus: FocusHandle,
+    /// Half-second blink state for the input's text caret.
+    cursor_visible: bool,
+    /// `true` when Cmd+A has selected the whole query so the next typed
+    /// character (or backspace) replaces it, matching the name box's behaviour.
+    select_all: bool,
+}
+
+/// How often the find input's text caret toggles visibility, matching the
+/// macOS default cursor blink rate.
+const SEARCH_CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Selection {
@@ -742,6 +789,7 @@ impl SpreadsheetViewer {
             freeze_drag: None,
             layouts,
             load_started: Some(load_started),
+            search: None,
         }
     }
 
@@ -761,6 +809,149 @@ impl SpreadsheetViewer {
         let text = self.active_sheet().range_to_tsv(self.selection.range);
         let html = self.active_sheet().range_to_html(self.selection.range);
         write_rich_clipboard(&text, &html, cx);
+    }
+
+    fn open_search(&mut self, _: &OpenSearch, window: &mut Window, cx: &mut Context<'_, Self>) {
+        let newly_opened = self.search.is_none();
+        if newly_opened {
+            self.search = Some(SearchState {
+                query: String::new(),
+                last_completed_query: None,
+                current_match: None,
+                no_results: false,
+                in_flight: false,
+                request_seq: 0,
+                focus: cx.focus_handle(),
+                cursor_visible: true,
+                select_all: false,
+            });
+        }
+        if let Some(state) = self.search.as_mut() {
+            state.focus.focus(window);
+            // Re-pressing Cmd+F while the bar is already open should behave
+            // like the system Find: highlight the existing query so the next
+            // keystroke replaces it.
+            if !newly_opened && !state.query.is_empty() {
+                state.select_all = true;
+                state.cursor_visible = true;
+            }
+        }
+        cx.notify();
+        if newly_opened {
+            Self::spawn_cursor_blink(cx);
+        }
+    }
+
+    /// Drives the find input's blinking caret. Runs while the search bar is
+    /// open; exits as soon as `self.search` becomes `None`, so closing the bar
+    /// (or switching sheets) stops the task naturally.
+    fn spawn_cursor_blink(cx: &mut Context<'_, Self>) {
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(SEARCH_CURSOR_BLINK_INTERVAL)
+                    .await;
+                let keep_going = this
+                    .update(cx, |viewer, cx| {
+                        let Some(state) = viewer.search.as_mut() else {
+                            return false;
+                        };
+                        state.cursor_visible = !state.cursor_visible;
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn close_search(&mut self, window: &mut Window, cx: &mut Context<'_, Self>) {
+        if let Some(state) = self.search.as_mut() {
+            // Invalidate any in-flight task's completion: apply_search_result
+            // will see the seq mismatch (state is already gone after take, but
+            // the bump matches the pattern used everywhere else).
+            state.request_seq = state.request_seq.wrapping_add(1);
+        }
+        self.search = None;
+        self.focus_handle.focus(window);
+        cx.notify();
+    }
+
+    fn run_search(&mut self, direction: SearchDirection, cx: &mut Context<'_, Self>) {
+        let Some(state) = self.search.as_mut() else {
+            return;
+        };
+        let query_lower = state.query.to_lowercase();
+        if query_lower.is_empty() {
+            state.current_match = None;
+            state.no_results = false;
+            cx.notify();
+            return;
+        }
+
+        // Same query as the last completed search → advance from the previous
+        // match. Otherwise restart from the current selection anchor.
+        let start = if state.last_completed_query.as_deref() == Some(query_lower.as_str())
+            && let Some(coord) = state.current_match
+        {
+            coord
+        } else {
+            self.selection.anchor
+        };
+
+        let seq = state.request_seq.wrapping_add(1);
+        state.request_seq = seq;
+        state.in_flight = true;
+        cx.notify();
+
+        let workbook = Arc::clone(&self.workbook);
+        let sheet_ix = self.active_sheet;
+        let query_for_task = query_lower.clone();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let sheet = workbook.sheet(sheet_ix);
+                    find_next_match(sheet, start, &query_for_task, direction)
+                })
+                .await;
+            let _ = this.update(cx, |viewer, cx| {
+                viewer.apply_search_result(seq, query_lower, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn apply_search_result(
+        &mut self,
+        seq: u64,
+        query_lower: String,
+        found: Option<CellCoord>,
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some(state) = self.search.as_mut() else {
+            return;
+        };
+        if state.request_seq != seq {
+            // Superseded by a newer search.
+            return;
+        }
+        state.in_flight = false;
+        state.last_completed_query = Some(query_lower);
+        if let Some(coord) = found {
+            state.current_match = Some(coord);
+            state.no_results = false;
+            self.selection = Selection::single(coord);
+            self.scroll_to_cell_centered(coord);
+        } else {
+            state.current_match = None;
+            state.no_results = true;
+        }
+        cx.notify();
     }
 
     fn close_file(&mut self, _: &CloseFile, window: &mut Window, cx: &mut Context<'_, Self>) {
@@ -790,6 +981,9 @@ impl SpreadsheetViewer {
         self.show_summary_menu = false;
         self.horizontal_scroll.set_offset(point(px(0.0), px(0.0)));
         self.vertical_offset = 0.0;
+        // Search is scoped to the active sheet — a coord from the previous
+        // sheet is meaningless here.
+        self.search = None;
         true
     }
 
@@ -1182,6 +1376,7 @@ impl Render for SpreadsheetViewer {
             .key_context("SpreadsheetViewer")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::close_file))
             .bg(rgb(SHEET_BG))
             .text_color(rgb(CELL_TEXT))
@@ -1215,6 +1410,11 @@ impl Render for SpreadsheetViewer {
                 }
             })
             .child(title_bar(workbook.as_ref(), sheet_ix))
+            .children(
+                self.search
+                    .as_ref()
+                    .map(|state| search_bar(state, &self.focus_handle, &cx.entity())),
+            )
             .child(formula_bar(
                 workbook.sheet(sheet_ix),
                 selection,
@@ -1995,6 +2195,258 @@ fn scrollbar_position_to_scroll_offset(
 
     let thumb_start = (pointer_position - track_origin - pointer_offset).clamp(px(0.0), travel);
     max_offset * (thumb_start / travel)
+}
+
+const SEARCH_BAR_HEIGHT: f32 = 32.0;
+
+fn search_bar(
+    state: &SearchState,
+    grid_focus: &FocusHandle,
+    entity: &Entity<SpreadsheetViewer>,
+) -> Div {
+    let query = state.query.clone();
+    let status_text = if state.in_flight {
+        "Searching…".to_owned()
+    } else if state.no_results && !state.query.is_empty() {
+        "No results".to_owned()
+    } else {
+        String::new()
+    };
+
+    div()
+        .h(px(SEARCH_BAR_HEIGHT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .bg(rgb(HEADER_BG))
+        .border_b_1()
+        .border_color(rgb(GRID_COLOR))
+        .child(search_input(state, grid_focus, entity, query, status_text))
+        .child(search_button(
+            "‹",
+            "search-prev",
+            &state.focus,
+            entity,
+            SearchDirection::Backward,
+        ))
+        .child(search_button(
+            "›",
+            "search-next",
+            &state.focus,
+            entity,
+            SearchDirection::Forward,
+        ))
+        .child(search_close_button(grid_focus, entity))
+}
+
+fn search_input(
+    state: &SearchState,
+    grid_focus: &FocusHandle,
+    entity: &Entity<SpreadsheetViewer>,
+    query: String,
+    status_text: String,
+) -> Stateful<Div> {
+    // A 1px-wide vertical bar painted right after the query. Renders only on
+    // the visible half of the blink cycle so the caret blinks instead of
+    // sitting static like the name box's edit indicator. Hidden when the
+    // whole query is "selected" (Cmd+A), to match name-box behaviour.
+    let caret = (state.cursor_visible && !state.select_all).then(|| {
+        div()
+            .w(px(1.0))
+            .h(px(14.0))
+            .ml(px(1.0))
+            .bg(rgb(SELECTION_BORDER))
+    });
+
+    let text_element: AnyElement = if state.select_all && !state.query.is_empty() {
+        div()
+            .px_1()
+            .bg(rgb(SELECTION_INNER_BORDER))
+            .text_color(rgb(CELL_TEXT))
+            .child(query)
+            .into_any_element()
+    } else {
+        div().child(query).into_any_element()
+    };
+
+    div()
+        .id("search-input")
+        .track_focus(&state.focus)
+        .flex_1()
+        .h(px(24.0))
+        .flex()
+        .items_center()
+        .px_2()
+        .gap_2()
+        .bg(rgb(CELL_BG))
+        .border_1()
+        .border_color(rgb(SELECTION_BORDER))
+        .text_color(rgb(CELL_TEXT))
+        .cursor(CursorStyle::IBeam)
+        .on_mouse_down(MouseButton::Left, {
+            let focus = state.focus.clone();
+            move |_, window, _| {
+                focus.focus(window);
+            }
+        })
+        .on_key_down({
+            let entity = entity.clone();
+            let grid_focus = grid_focus.clone();
+            move |event, window, cx| {
+                if search_input_key_down(&entity, event, cx) {
+                    entity.update(cx, |viewer, cx| viewer.close_search(window, cx));
+                    grid_focus.focus(window);
+                }
+                cx.stop_propagation();
+            }
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .flex_1()
+                .min_w(px(0.0))
+                .child(text_element)
+                .children(caret),
+        )
+        .when(!status_text.is_empty(), |element| {
+            element.child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(FORMULA_FALLBACK_TEXT))
+                    .child(status_text),
+            )
+        })
+}
+
+fn search_button(
+    label: &'static str,
+    id: &'static str,
+    input_focus: &FocusHandle,
+    entity: &Entity<SpreadsheetViewer>,
+    direction: SearchDirection,
+) -> Stateful<Div> {
+    let entity = entity.clone();
+    let input_focus = input_focus.clone();
+    div()
+        .id(id)
+        .w(px(24.0))
+        .h(px(24.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(CELL_BG))
+        .border_1()
+        .border_color(rgb(GRID_COLOR))
+        .text_color(rgb(HEADER_TEXT))
+        .cursor(CursorStyle::PointingHand)
+        .child(label)
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            entity.update(cx, |viewer, cx| viewer.run_search(direction, cx));
+            // Keep the find input focused so the user can keep typing.
+            input_focus.focus(window);
+        })
+}
+
+fn search_close_button(
+    grid_focus: &FocusHandle,
+    entity: &Entity<SpreadsheetViewer>,
+) -> Stateful<Div> {
+    let entity = entity.clone();
+    let grid_focus = grid_focus.clone();
+    div()
+        .id("search-close")
+        .w(px(24.0))
+        .h(px(24.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgb(CELL_BG))
+        .border_1()
+        .border_color(rgb(GRID_COLOR))
+        .text_color(rgb(HEADER_TEXT))
+        .cursor(CursorStyle::PointingHand)
+        .child("✕")
+        .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+            entity.update(cx, |viewer, cx| viewer.close_search(window, cx));
+            grid_focus.focus(window);
+        })
+}
+
+/// Apply a keystroke to the find input. Returns `true` when the search bar
+/// should be closed (Escape) so the outer closure can refocus the grid.
+fn search_input_key_down(
+    entity: &Entity<SpreadsheetViewer>,
+    event: &KeyDownEvent,
+    cx: &mut App,
+) -> bool {
+    let key = event.keystroke.key.clone();
+    let key_char = event.keystroke.key_char.clone();
+    let modifiers = event.keystroke.modifiers;
+    let shift = modifiers.shift;
+    // `platform` is Cmd on macOS and the equivalent meta key elsewhere — the
+    // same modifier our key bindings target (e.g. cmd-c, cmd-f).
+    let select_all_chord = modifiers.platform && !modifiers.control && !modifiers.alt && key == "a";
+
+    let mut should_close = false;
+    entity.update(cx, |viewer, cx| {
+        let Some(state) = viewer.search.as_mut() else {
+            return;
+        };
+        if select_all_chord {
+            if !state.query.is_empty() {
+                state.select_all = true;
+                cx.notify();
+            }
+            return;
+        }
+        match key.as_str() {
+            "escape" => {
+                should_close = true;
+            }
+            "enter" => {
+                let direction = if shift {
+                    SearchDirection::Backward
+                } else {
+                    SearchDirection::Forward
+                };
+                viewer.run_search(direction, cx);
+            }
+            "backspace" => {
+                if state.select_all {
+                    state.query.clear();
+                } else {
+                    state.query.pop();
+                }
+                state.select_all = false;
+                // Force the next Enter to restart from the selection anchor
+                // rather than advancing from a stale match.
+                state.last_completed_query = None;
+                state.no_results = false;
+                state.cursor_visible = true;
+                cx.notify();
+            }
+            _ => {
+                if let Some(text) = key_char
+                    && !text.is_empty()
+                    && !text.chars().any(char::is_control)
+                {
+                    if state.select_all {
+                        state.query.clear();
+                    }
+                    state.query.push_str(&text);
+                    state.select_all = false;
+                    state.last_completed_query = None;
+                    state.no_results = false;
+                    state.cursor_visible = true;
+                    cx.notify();
+                }
+            }
+        }
+    });
+    should_close
 }
 
 #[allow(clippy::too_many_arguments)]

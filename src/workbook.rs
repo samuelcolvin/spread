@@ -987,6 +987,53 @@ impl CellCoord {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+/// Find the next cell whose `value` or `formula` (case-insensitive) contains
+/// `query_lower`. Searches strictly *after* `start` (Forward) or *before* it
+/// (Backward), wraps around once, and returns the first match. Returns `None`
+/// for an empty query, empty sheet, or no match. `query_lower` is assumed to
+/// already be lowercased by the caller so we only allocate once per search.
+pub(crate) fn find_next_match(
+    sheet: &SheetData,
+    start: CellCoord,
+    query_lower: &str,
+    direction: SearchDirection,
+) -> Option<CellCoord> {
+    if query_lower.is_empty() {
+        return None;
+    }
+    let rows = sheet.row_count();
+    let cols = sheet.col_count();
+    let total = rows.checked_mul(cols).filter(|t| *t > 0)?;
+    let start_row = start.row.min(rows - 1);
+    let start_col = start.col.min(cols - 1);
+    let start_idx = start_row * cols + start_col;
+
+    for step in 1..=total {
+        let idx = match direction {
+            SearchDirection::Forward => (start_idx + step) % total,
+            SearchDirection::Backward => (start_idx + total - step) % total,
+        };
+        let row = idx / cols;
+        let col = idx % cols;
+        let cell = sheet.cell_data(row, col);
+        if cell.value.to_lowercase().contains(query_lower)
+            || cell
+                .formula
+                .as_deref()
+                .is_some_and(|f| f.to_lowercase().contains(query_lower))
+        {
+            return Some(CellCoord::new(row, col));
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct CellRange {
     pub(crate) start: CellCoord,
     pub(crate) end: CellCoord,
@@ -2256,5 +2303,131 @@ mod tests {
     ) {
         zip.start_file(name, options).unwrap();
         zip.write_all(contents.as_bytes()).unwrap();
+    }
+
+    fn search_sheet(rows: Vec<Vec<CellData>>) -> SheetData {
+        SheetData::new(
+            Some("Sheet1".to_owned()),
+            rows,
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        )
+    }
+
+    fn text_cell(value: &str) -> CellData {
+        CellData {
+            value: value.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn find_match_is_case_insensitive() {
+        let sheet = search_sheet(vec![
+            vec![text_cell("Apple"), text_cell("Banana")],
+            vec![text_cell("hello"), text_cell("WORLD")],
+        ]);
+        let found = find_next_match(
+            &sheet,
+            CellCoord::new(0, 0),
+            "world",
+            SearchDirection::Forward,
+        );
+        assert_eq!(found, Some(CellCoord::new(1, 1)));
+    }
+
+    #[test]
+    fn find_match_searches_formula_in_addition_to_value() {
+        let sheet = search_sheet(vec![vec![CellData {
+            value: "12".to_owned(),
+            formula: Some("=SUM(A1:A2)".to_owned()),
+            ..Default::default()
+        }]]);
+        let found = find_next_match(
+            &sheet,
+            CellCoord::new(0, 0),
+            "sum",
+            SearchDirection::Forward,
+        );
+        assert_eq!(found, Some(CellCoord::new(0, 0)));
+    }
+
+    #[test]
+    fn find_next_skips_starting_cell() {
+        let sheet = search_sheet(vec![
+            vec![text_cell("foo"), text_cell("bar")],
+            vec![text_cell("baz"), text_cell("foo")],
+        ]);
+        let found = find_next_match(
+            &sheet,
+            CellCoord::new(0, 0),
+            "foo",
+            SearchDirection::Forward,
+        );
+        assert_eq!(found, Some(CellCoord::new(1, 1)));
+    }
+
+    #[test]
+    fn find_next_wraps_around() {
+        let sheet = search_sheet(vec![
+            vec![text_cell("foo"), text_cell("bar")],
+            vec![text_cell("baz"), text_cell("qux")],
+        ]);
+        let found = find_next_match(
+            &sheet,
+            CellCoord::new(1, 1),
+            "foo",
+            SearchDirection::Forward,
+        );
+        assert_eq!(found, Some(CellCoord::new(0, 0)));
+    }
+
+    #[test]
+    fn find_previous_walks_backwards() {
+        let sheet = search_sheet(vec![
+            vec![text_cell("foo"), text_cell("bar"), text_cell("baz")],
+            vec![text_cell("a"), text_cell("b"), text_cell("c")],
+            vec![text_cell("x"), text_cell("y"), text_cell("foo")],
+        ]);
+        let found = find_next_match(
+            &sheet,
+            CellCoord::new(1, 1),
+            "foo",
+            SearchDirection::Backward,
+        );
+        assert_eq!(found, Some(CellCoord::new(0, 0)));
+    }
+
+    #[test]
+    fn find_returns_none_when_no_match() {
+        let sheet = search_sheet(vec![vec![text_cell("foo"), text_cell("bar")]]);
+        let found = find_next_match(
+            &sheet,
+            CellCoord::new(0, 0),
+            "zzz",
+            SearchDirection::Forward,
+        );
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_returns_none_for_empty_query() {
+        let sheet = search_sheet(vec![vec![text_cell("foo")]]);
+        let found = find_next_match(&sheet, CellCoord::new(0, 0), "", SearchDirection::Forward);
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn find_returns_none_for_empty_sheet() {
+        let sheet = search_sheet(Vec::new());
+        let found = find_next_match(
+            &sheet,
+            CellCoord::new(0, 0),
+            "foo",
+            SearchDirection::Forward,
+        );
+        assert_eq!(found, None);
     }
 }

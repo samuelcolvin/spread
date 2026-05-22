@@ -17,7 +17,7 @@ use gpui::{
 };
 
 use crate::{
-    view::{CopySelection, SpreadsheetViewer, WINDOW_HEIGHT, WINDOW_WIDTH},
+    view::{OpenSearch, SpreadsheetViewer, WINDOW_HEIGHT, WINDOW_WIDTH, bind_viewer_keys},
     workbook::load_workbook,
 };
 
@@ -183,11 +183,7 @@ fn run(cli: &Cli) -> Result<()> {
             return;
         }
 
-        cx.bind_keys([KeyBinding::new(
-            "cmd-c",
-            CopySelection,
-            Some("SpreadsheetViewer"),
-        )]);
+        bind_viewer_keys(cx);
         cx.bind_keys([KeyBinding::new("cmd-o", OpenDocument, None)]);
         cx.bind_keys([KeyBinding::new("cmd-q", CloseFile, None)]);
         let open_dialog_show_splash_after_document_close =
@@ -218,6 +214,8 @@ fn run(cli: &Cli) -> Result<()> {
                 name: "File".into(),
                 items: vec![
                     MenuItem::action("Open...", OpenDocument),
+                    MenuItem::separator(),
+                    MenuItem::action("Find", OpenSearch),
                     MenuItem::separator(),
                     MenuItem::action("Close File", CloseFile),
                 ],
