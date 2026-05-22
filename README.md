@@ -1,11 +1,18 @@
 # spread
 
+[![ci](https://github.com/samuelcolvin/spread/actions/workflows/ci.yml/badge.svg)](https://github.com/samuelcolvin/spread/actions/workflows/ci.yml)
+
 A simple, fast spreadsheet viewer written in Rust using [GPUI](https://www.gpui.rs/).
 
 Editing is not supported.
 
 > [!NOTE]
 > As with most things in 2026, the code here was almost entirely written by AI - using both Codex + GPT-5.5 and Claude Code + Opus 4.7 1M.
+
+---
+
+> [!NOTE]
+> No PRs, they don't make sense on majority AI generated code like this. If you want a feature, please create an issue, if you really want to help, include the proposed prompt in the issue.
 
 ## Why
 
