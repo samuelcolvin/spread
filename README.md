@@ -14,7 +14,7 @@ I wanted a quick way to view spreadsheets locally, without the need to open a do
 Features:
 
 - supports CSV, Parquet, and XLSX file formats
-- loads 30M row Parquet files in 100ms
+- loads 30M row Parquet files in 112ms
 - supports copy and paste to Google sheets or excel
 - displays formatting such as dates, currency, percentages, bold text, colors, and column/row dimensions
 - `--display xml` mode from the CLI to make it easy for LLMs to "view" spreadsheets
