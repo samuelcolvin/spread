@@ -1125,6 +1125,24 @@ pub(crate) struct CellStyle {
     pub(crate) background_color: Option<u32>,
     pub(crate) text_color: Option<u32>,
     pub(crate) wrap_text: bool,
+    pub(crate) borders: CellBorders,
+}
+
+/// Explicit cell borders defined by the workbook. Each side holds the border
+/// color when present; `None` means the side has no author-defined border and
+/// falls back to the viewer's default grid line.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CellBorders {
+    pub(crate) top: Option<u32>,
+    pub(crate) right: Option<u32>,
+    pub(crate) bottom: Option<u32>,
+    pub(crate) left: Option<u32>,
+}
+
+impl CellBorders {
+    pub(crate) fn any(&self) -> bool {
+        self.top.is_some() || self.right.is_some() || self.bottom.is_some() || self.left.is_some()
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -1858,6 +1876,53 @@ mod tests {
     }
 
     #[test]
+    fn reads_xlsx_cell_borders_from_metadata() {
+        let path = temp_file("spread-bordered.xlsx");
+        let styles_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <borders count="3">
+    <border/>
+    <border>
+      <left style="thin"><color rgb="FF000000"/></left>
+      <right style="thin"><color rgb="FFFF0000"/></right>
+      <top style="none"/>
+      <bottom style="thin"/>
+    </border>
+    <border><left style="thin"/></border>
+  </borders>
+  <cellXfs count="3">
+    <xf borderId="0" fontId="0" fillId="0" numFmtId="0"/>
+    <xf borderId="1" fontId="0" fillId="0" numFmtId="0"/>
+    <xf borderId="2" fontId="0" fillId="0" numFmtId="0"/>
+  </cellXfs>
+</styleSheet>"#;
+        let sheet_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1"><c r="A1" s="0"/><c r="B1" s="1"/><c r="C1" s="2"/></row>
+  </sheetData>
+</worksheet>"#;
+        write_metadata_xlsx(&path, styles_xml, sheet_xml);
+
+        let metadata = XlsxMetadata::read(&path).unwrap();
+
+        let plain = metadata.cell_style(0, 0).visual_style.borders;
+        assert!(!plain.any());
+
+        let full = metadata.cell_style(0, 1).visual_style.borders;
+        assert_eq!(full.left, Some(0x00_00_00));
+        assert_eq!(full.right, Some(0xff_00_00));
+        assert_eq!(full.top, None);
+        assert_eq!(full.bottom, Some(0x00_00_00));
+
+        let style_only = metadata.cell_style(0, 2).visual_style.borders;
+        assert_eq!(style_only.left, Some(0x00_00_00));
+        assert_eq!(style_only.right, None);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn reads_xlsx_freeze_panes_from_metadata() {
         let path = temp_file("spread-frozen.xlsx");
         let styles_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -2031,6 +2096,7 @@ mod tests {
                     background_color: Some(0xaa_bb_cc),
                     text_color: Some(0x11_22_33),
                     wrap_text: false,
+                    borders: CellBorders::default(),
                 },
                 ..Default::default()
             }]],

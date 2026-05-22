@@ -6,7 +6,7 @@ use quick_xml::{Reader as XmlReader, events::Event};
 use zip::ZipArchive;
 
 use crate::workbook::{
-    CellCoord, CellData, CellDisplayFormat, CellRange, CellRawValue, CellStyle,
+    CellBorders, CellCoord, CellData, CellDisplayFormat, CellRange, CellRawValue, CellStyle,
     DEFAULT_COLUMN_WIDTH, DEFAULT_ROW_HEIGHT, SheetData, SheetFreeze, SheetMerges, WorkbookData,
     calculate_missing_formula_values, display_float,
 };
@@ -229,6 +229,7 @@ fn read_styles(archive: &mut ZipArchive<File>) -> Result<Vec<XlsxStyle>> {
     let mut number_formats = builtin_number_formats();
     let mut fonts = Vec::new();
     let mut fills = Vec::new();
+    let mut borders = Vec::new();
     let mut styles = Vec::new();
     let mut pending_xf = None;
     let mut in_fonts = false;
@@ -238,6 +239,10 @@ fn read_styles(archive: &mut ZipArchive<File>) -> Result<Vec<XlsxStyle>> {
     let mut in_fill = false;
     let mut in_solid_pattern_fill = false;
     let mut fill_color = None;
+    let mut in_borders = false;
+    let mut in_border = false;
+    let mut current_border = CellBorders::default();
+    let mut current_side: Option<BorderSide> = None;
     let mut in_cell_xfs = false;
 
     loop {
@@ -312,6 +317,52 @@ fn read_styles(archive: &mut ZipArchive<File>) -> Result<Vec<XlsxStyle>> {
             {
                 fill_color = attr_rgb(&reader, &event)?;
             }
+            Event::Start(event) if event.local_name().as_ref() == b"borders" => {
+                in_borders = true;
+            }
+            Event::End(event) if event.local_name().as_ref() == b"borders" => {
+                in_borders = false;
+            }
+            Event::Empty(event) if in_borders && event.local_name().as_ref() == b"border" => {
+                borders.push(CellBorders::default());
+            }
+            Event::Start(event) if in_borders && event.local_name().as_ref() == b"border" => {
+                in_border = true;
+                current_border = CellBorders::default();
+            }
+            Event::End(event) if in_border && event.local_name().as_ref() == b"border" => {
+                in_border = false;
+                current_side = None;
+                borders.push(current_border);
+            }
+            Event::Start(event) | Event::Empty(event)
+                if in_border && border_side(event.local_name().as_ref()).is_some() =>
+            {
+                let side = border_side(event.local_name().as_ref()).expect("border side");
+                let has_border =
+                    attr_string(&reader, &event, b"style")?.is_some_and(|style| style != "none");
+                if has_border {
+                    set_border_side(&mut current_border, side, Some(DEFAULT_BORDER_COLOR));
+                    current_side = Some(side);
+                } else {
+                    current_side = None;
+                }
+            }
+            Event::End(event)
+                if in_border && border_side(event.local_name().as_ref()).is_some() =>
+            {
+                current_side = None;
+            }
+            Event::Start(event) | Event::Empty(event)
+                if in_border
+                    && event.local_name().as_ref() == b"color"
+                    && current_side.is_some() =>
+            {
+                if let Some(rgb) = attr_rgb(&reader, &event)? {
+                    let side = current_side.expect("current border side");
+                    set_border_side(&mut current_border, side, Some(rgb));
+                }
+            }
             Event::Empty(event) if in_cell_xfs && event.local_name().as_ref() == b"xf" => {
                 styles.push(xlsx_style_from_xf(
                     &reader,
@@ -319,6 +370,7 @@ fn read_styles(archive: &mut ZipArchive<File>) -> Result<Vec<XlsxStyle>> {
                     &number_formats,
                     &fonts,
                     &fills,
+                    &borders,
                 )?);
             }
             Event::Start(event) if in_cell_xfs && event.local_name().as_ref() == b"xf" => {
@@ -328,6 +380,7 @@ fn read_styles(archive: &mut ZipArchive<File>) -> Result<Vec<XlsxStyle>> {
                     &number_formats,
                     &fonts,
                     &fills,
+                    &borders,
                 )?);
             }
             Event::Start(event) | Event::Empty(event)
@@ -350,12 +403,44 @@ fn read_styles(archive: &mut ZipArchive<File>) -> Result<Vec<XlsxStyle>> {
     Ok(styles)
 }
 
+/// Default border color (black) used when a side declares a style but no
+/// explicit color, matching how spreadsheet apps render `style`-only borders.
+const DEFAULT_BORDER_COLOR: u32 = 0x00_00_00;
+
+#[derive(Debug, Clone, Copy)]
+enum BorderSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+fn border_side(local_name: &[u8]) -> Option<BorderSide> {
+    match local_name {
+        b"top" => Some(BorderSide::Top),
+        b"right" => Some(BorderSide::Right),
+        b"bottom" => Some(BorderSide::Bottom),
+        b"left" => Some(BorderSide::Left),
+        _ => None,
+    }
+}
+
+fn set_border_side(borders: &mut CellBorders, side: BorderSide, color: Option<u32>) {
+    match side {
+        BorderSide::Top => borders.top = color,
+        BorderSide::Right => borders.right = color,
+        BorderSide::Bottom => borders.bottom = color,
+        BorderSide::Left => borders.left = color,
+    }
+}
+
 fn xlsx_style_from_xf(
     reader: &XmlReader<&[u8]>,
     event: &quick_xml::events::BytesStart<'_>,
     number_formats: &HashMap<usize, String>,
     fonts: &[CellStyle],
     fills: &[Option<u32>],
+    borders: &[CellBorders],
 ) -> Result<XlsxStyle> {
     let display_format = attr_usize(reader, event, b"numFmtId")?
         .and_then(|id| number_formats.get(&id))
@@ -368,11 +453,16 @@ fn xlsx_style_from_xf(
         .and_then(|id| fills.get(id))
         .copied()
         .flatten();
+    let cell_borders = attr_usize(reader, event, b"borderId")?
+        .and_then(|id| borders.get(id))
+        .copied()
+        .unwrap_or_default();
 
     Ok(XlsxStyle {
         display_format,
         visual_style: CellStyle {
             background_color,
+            borders: cell_borders,
             ..font_style
         },
     })

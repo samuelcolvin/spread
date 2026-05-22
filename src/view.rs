@@ -16,8 +16,8 @@ use gpui::{
 use crate::{
     CloseFile,
     workbook::{
-        CellCoord, CellData, CellRange, CellRawValue, SelectionEdgeSides, SheetData, SheetMerges,
-        SheetRowLayout, WorkbookData,
+        CellBorders, CellCoord, CellData, CellRange, CellRawValue, SelectionEdgeSides, SheetData,
+        SheetMerges, SheetRowLayout, WorkbookData,
     },
 };
 
@@ -191,6 +191,9 @@ struct RowCell {
     text_width: f32,
     formula_fallback: bool,
     merge: MergeKind,
+    /// Borders to paint for this cell, normalized so each shared edge belongs to
+    /// a single cell: only the right and bottom sides are ever set.
+    borders: CellBorders,
 }
 
 #[derive(Clone, Copy)]
@@ -2718,6 +2721,7 @@ fn merge_overlay_cell(
             base
         }
     };
+    let borders = row_cell.borders;
 
     let mut element = div()
         .absolute()
@@ -2728,9 +2732,14 @@ fn merge_overlay_cell(
         .flex()
         .px_2()
         .overflow_hidden()
-        .border_r_1()
-        .border_b_1()
-        .border_color(rgb(GRID_COLOR))
+        // Cells with explicit borders drop their CSS grid lines; the border
+        // overlay paints the whole frame so author borders stay flush.
+        .when(!borders.any(), |element| {
+            element
+                .border_r_1()
+                .border_b_1()
+                .border_color(rgb(GRID_COLOR))
+        })
         .bg(rgb(background))
         .text_color(rgb(text_color));
 
@@ -2745,6 +2754,10 @@ fn merge_overlay_cell(
     }
 
     let mut element = element.child(row_cell.text.clone());
+
+    if borders.any() {
+        element = element.child(cell_border_overlay(borders));
+    }
 
     if state.active || state.selected {
         element = element.child(selection_outline(state.selection_edges));
@@ -2784,12 +2797,14 @@ fn build_row_cells(
             let data = sheet.cell_data(row_ix, col_ix);
             let (text, formula_fallback) = cell_display_text(&data);
             let text_width = measure_cell_text_width(&data, &text, formula_fallback, window);
+            let borders = effective_cell_borders(sheet, row_ix, col_ix, data.style.borders);
             RowCell {
                 data,
                 text,
                 text_width,
                 formula_fallback,
                 merge: layout.merge_kind(row_ix, col_ix),
+                borders,
             }
         })
         .collect()
@@ -3257,6 +3272,7 @@ fn cell(
     // Merged cells (anchor or covered) are painted by the merge overlay layer;
     // the base cell stays blank and borderless so the region looks unified.
     let merged = row_cell.merge != MergeKind::None;
+    let borders = row_cell.borders;
     let mut element = div()
         .w(px(width))
         .h(px(row_height))
@@ -3266,11 +3282,18 @@ fn cell(
         .overflow_hidden()
         .relative()
         .when(!merged, |element| {
-            element
-                .border_1()
-                .border_color(rgb(border_color))
-                .border_l_0()
-                .border_t_0()
+            // A cell with explicit borders drops all of its CSS grid lines and
+            // lets the border overlay paint the whole frame, so author borders
+            // sit flush over the grid instead of doubling up beside it.
+            if borders.any() {
+                element
+            } else {
+                element
+                    .border_1()
+                    .border_color(rgb(border_color))
+                    .border_l_0()
+                    .border_t_0()
+            }
         })
         .bg(rgb({
             let base = cell.style.background_color.unwrap_or(CELL_BG);
@@ -3298,6 +3321,10 @@ fn cell(
     } else {
         element
     };
+
+    if !merged && borders.any() {
+        element = element.child(cell_border_overlay(borders));
+    }
 
     if highlighted && !merged {
         element = element.child(selection_outline(state.selection_edges));
@@ -3523,6 +3550,71 @@ fn selection_outline(edges: SelectionEdgeSides) -> AnyElement {
                     color,
                 ));
             }
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+    .into_any_element()
+}
+
+/// Normalized borders for the cell at (`row`, `col`): every shared edge is owned
+/// by exactly one cell. Only the right and bottom sides are produced — a cell's
+/// right side absorbs the next cell's left border, and its bottom side absorbs
+/// the border below's top border. Author borders on the sheet's top or left
+/// outer edge have no owning cell, so they are dropped.
+fn effective_cell_borders(
+    sheet: &SheetData,
+    row: usize,
+    col: usize,
+    own: CellBorders,
+) -> CellBorders {
+    CellBorders {
+        top: None,
+        left: None,
+        right: own
+            .right
+            .or(sheet.cell_data(row, col + 1).style.borders.left),
+        bottom: own
+            .bottom
+            .or(sheet.cell_data(row + 1, col).style.borders.top),
+    }
+}
+
+/// Paints a cell's right and bottom grid lines, using the workbook-defined
+/// border color where present and the default grid color otherwise. The
+/// horizontal edge is painted before the vertical one so corners stay crisp.
+fn cell_border_overlay(borders: CellBorders) -> AnyElement {
+    if !borders.any() {
+        return div().into_any_element();
+    }
+
+    canvas(
+        |_, _, _| (),
+        move |bounds, (), window, _| {
+            let thickness = px(1.0);
+
+            window.paint_quad(gpui::fill(
+                Bounds {
+                    origin: point(
+                        bounds.origin.x,
+                        bounds.origin.y + bounds.size.height - thickness,
+                    ),
+                    size: gpui::size(bounds.size.width, thickness),
+                },
+                rgb(borders.bottom.unwrap_or(GRID_COLOR)),
+            ));
+            window.paint_quad(gpui::fill(
+                Bounds {
+                    origin: point(
+                        bounds.origin.x + bounds.size.width - thickness,
+                        bounds.origin.y,
+                    ),
+                    size: gpui::size(thickness, bounds.size.height),
+                },
+                rgb(borders.right.unwrap_or(GRID_COLOR)),
+            ));
         },
     )
     .absolute()
@@ -3943,6 +4035,7 @@ mod tests {
                 text_width: 100.0,
                 formula_fallback: false,
                 merge: MergeKind::None,
+                borders: CellBorders::default(),
             },
             empty_row_cell(),
         ];
@@ -4014,6 +4107,7 @@ mod tests {
             text_width: text.chars().count() as f32 * 7.0,
             formula_fallback: false,
             merge: MergeKind::None,
+            borders: CellBorders::default(),
         }
     }
 
@@ -4024,6 +4118,7 @@ mod tests {
             text_width: 0.0,
             formula_fallback: false,
             merge: MergeKind::None,
+            borders: CellBorders::default(),
         }
     }
 
