@@ -4,3 +4,4 @@ target/
 /scratch/
 /TODO.md
 .idea/*
+.DS_Store
