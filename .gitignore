@@ -3,3 +3,4 @@ target/
 /tmp/
 /scratch/
 /TODO.md
+.idea/*

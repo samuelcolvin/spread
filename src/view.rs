@@ -36,6 +36,9 @@ const CELL_TEXT: u32 = 0x20_21_24;
 const TITLE_BAR_BG: u32 = 0xf3_f4_f7;
 const FORMULA_FALLBACK_TEXT: u32 = 0x5f_63_68;
 const SELECTED_CELL_BG: u32 = 0xe8_f0_fe;
+const SEARCH_MATCH_BG: u32 = 0xff_f9_e6;
+const SEARCH_CURRENT_BG: u32 = 0xff_ea_7a;
+const SEARCH_BAR_HEIGHT: f32 = 36.0;
 const ACTIVE_TAB_BG: u32 = 0xff_ff_ff;
 const HOVER_CELL_BG: u32 = 0xee_f2_f7;
 const SELECTION_BORDER: u32 = 0x1a_73_e8;
@@ -76,7 +79,10 @@ fn selection_tint(base: u32) -> u32 {
     (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
-actions!(spreadsheet_viewer, [CopySelection]);
+actions!(
+    spreadsheet_viewer,
+    [CopySelection, Find, FindNext, FindPrevious]
+);
 
 pub(crate) struct SpreadsheetViewer {
     workbook: Arc<WorkbookData>,
@@ -89,6 +95,11 @@ pub(crate) struct SpreadsheetViewer {
     /// When `true` the whole name box buffer is "selected", so the next typed
     /// character replaces it (set by double-clicking the box).
     name_box_select_all: bool,
+    search_open: bool,
+    search_query: String,
+    search_focus: FocusHandle,
+    search_matches: Vec<CellCoord>,
+    search_match_index: Option<usize>,
     /// Scrollable viewport `(width, height)` captured at the last render so
     /// keyboard-driven navigation can center a target without re-laying-out.
     scrollable_viewport: (f32, f32),
@@ -166,11 +177,93 @@ impl SummaryMetric {
 }
 
 #[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
 struct CellRenderState {
     coord: CellCoord,
     selected: bool,
     selection_edges: SelectionEdgeSides,
     active: bool,
+    search_match: bool,
+    search_current: bool,
+}
+
+#[derive(Clone, Default)]
+struct SearchHighlight {
+    match_cells: std::collections::HashSet<(usize, usize)>,
+    current: Option<CellCoord>,
+}
+
+impl SearchHighlight {
+    fn from_matches(matches: &[CellCoord], current_index: Option<usize>) -> Self {
+        Self {
+            match_cells: matches.iter().map(|coord| (coord.row, coord.col)).collect(),
+            current: current_index.and_then(|ix| matches.get(ix).copied()),
+        }
+    }
+
+    fn flags(&self, coord: CellCoord) -> (bool, bool) {
+        let search_match = self.match_cells.contains(&(coord.row, coord.col));
+        let search_current = self.current == Some(coord);
+        (search_match, search_current)
+    }
+}
+
+fn cell_render_state(
+    coord: CellCoord,
+    selection: Selection,
+    search: &SearchHighlight,
+) -> CellRenderState {
+    let (search_match, search_current) = search.flags(coord);
+    CellRenderState {
+        coord,
+        selected: selection.contains(coord.row, coord.col),
+        selection_edges: selection.range.edge_sides(coord.row, coord.col),
+        active: selection.anchor == coord,
+        search_match,
+        search_current,
+    }
+}
+
+fn cell_background(base: u32, state: CellRenderState) -> u32 {
+    if state.search_current {
+        SEARCH_CURRENT_BG
+    } else if state.search_match {
+        SEARCH_MATCH_BG
+    } else if state.selected && !state.active {
+        selection_tint(base)
+    } else {
+        base
+    }
+}
+
+fn search_match_label(index: Option<usize>, total: usize) -> String {
+    match (index, total) {
+        (_, 0) => "No matches".to_owned(),
+        (Some(ix), total) => format!("{} of {}", ix + 1, total),
+        (None, _) => "No matches".to_owned(),
+    }
+}
+
+fn next_search_index(current: Option<usize>, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match current {
+        None => 0,
+        Some(ix) if ix + 1 >= len => 0,
+        Some(ix) => ix + 1,
+    })
+}
+
+fn previous_search_index(current: Option<usize>, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match current {
+        None => len - 1,
+        Some(0) => len - 1,
+        Some(ix) => ix - 1,
+    })
 }
 
 /// How a cell participates in a merged region.
@@ -713,6 +806,7 @@ impl SpreadsheetViewer {
         let focus_handle = cx.focus_handle();
         focus_handle.focus(window);
         let name_box_focus = cx.focus_handle();
+        let search_focus = cx.focus_handle();
 
         let layouts: Vec<SheetLayout> = (0..workbook.sheet_count())
             .map(|sheet_ix| SheetLayout::new(workbook.sheet(sheet_ix)))
@@ -725,6 +819,11 @@ impl SpreadsheetViewer {
             name_box_focus,
             name_box_input: None,
             name_box_select_all: false,
+            search_open: false,
+            search_query: String::new(),
+            search_focus,
+            search_matches: Vec::new(),
+            search_match_index: None,
             scrollable_viewport: (0.0, 0.0),
             active_sheet,
             selection: Selection::single(CellCoord::new(0, 0)),
@@ -760,6 +859,75 @@ impl SpreadsheetViewer {
         write_rich_clipboard(&text, &html, cx);
     }
 
+    fn refresh_search(&mut self) {
+        self.search_matches = self.active_sheet().find_display_matches(&self.search_query);
+        self.search_match_index = if self.search_matches.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+    }
+
+    fn go_to_match(&mut self, index: usize) {
+        let Some(coord) = self.search_matches.get(index).copied() else {
+            return;
+        };
+        self.search_match_index = Some(index);
+        self.select_cell(coord, false);
+        self.scroll_to_cell_centered(coord);
+    }
+
+    fn close_search(&mut self, window: &mut Window) {
+        self.search_open = false;
+        self.search_matches.clear();
+        self.search_match_index = None;
+        self.focus_handle.focus(window);
+    }
+
+    fn find(&mut self, _: &Find, window: &mut Window, cx: &mut Context<'_, Self>) {
+        self.search_open = true;
+        if !self.search_query.is_empty() {
+            self.refresh_search();
+            if let Some(ix) = self.search_match_index {
+                self.go_to_match(ix);
+            }
+        }
+        self.search_focus.focus(window);
+        cx.notify();
+    }
+
+    fn find_next(&mut self, _: &FindNext, _window: &mut Window, cx: &mut Context<'_, Self>) {
+        if !self.search_open {
+            self.search_open = true;
+        }
+        if self.search_matches.is_empty() && !self.search_query.is_empty() {
+            self.refresh_search();
+        }
+        if let Some(ix) = next_search_index(self.search_match_index, self.search_matches.len()) {
+            self.go_to_match(ix);
+        }
+        cx.notify();
+    }
+
+    fn find_previous(
+        &mut self,
+        _: &FindPrevious,
+        _window: &mut Window,
+        cx: &mut Context<'_, Self>,
+    ) {
+        if !self.search_open {
+            self.search_open = true;
+        }
+        if self.search_matches.is_empty() && !self.search_query.is_empty() {
+            self.refresh_search();
+        }
+        if let Some(ix) = previous_search_index(self.search_match_index, self.search_matches.len())
+        {
+            self.go_to_match(ix);
+        }
+        cx.notify();
+    }
+
     fn close_file(&mut self, _: &CloseFile, window: &mut Window, cx: &mut Context<'_, Self>) {
         // Handle Close File inside the document window, not as a global app action.
         // GPUI menu actions are dispatched through the active window first; removing
@@ -787,6 +955,9 @@ impl SpreadsheetViewer {
         self.show_summary_menu = false;
         self.horizontal_scroll.set_offset(point(px(0.0), px(0.0)));
         self.vertical_offset = 0.0;
+        if self.search_open && !self.search_query.is_empty() {
+            self.refresh_search();
+        }
         true
     }
 
@@ -1120,13 +1291,20 @@ impl Render for SpreadsheetViewer {
         let selection = self.selection;
         let layout = self.active_layout().clone();
         let formula_height = formula_bar_height_for_sheet(workbook.sheet(sheet_ix), selection);
+        let search_height = if self.search_open {
+            SEARCH_BAR_HEIGHT
+        } else {
+            0.0
+        };
         let window_size = window.bounds().size;
         let scrollbars = scrollbar_visibility_for_window_size(
             &layout,
-            formula_height,
+            formula_height + search_height,
             f32::from(window_size.width),
             f32::from(window_size.height),
         );
+        let search_highlight =
+            SearchHighlight::from_matches(&self.search_matches, self.search_match_index);
         if !scrollbars.horizontal {
             let offset = self.horizontal_scroll.offset();
             if offset.x != px(0.0) {
@@ -1145,6 +1323,7 @@ impl Render for SpreadsheetViewer {
         let body_height = (f32::from(window_size.height)
             - TITLE_BAR_HEIGHT
             - formula_height
+            - search_height
             - HEADER_HEIGHT
             - FOOTER_HEIGHT
             - if scrollbars.horizontal {
@@ -1179,6 +1358,9 @@ impl Render for SpreadsheetViewer {
             .key_context("SpreadsheetViewer")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::copy_selection))
+            .on_action(cx.listener(Self::find))
+            .on_action(cx.listener(Self::find_next))
+            .on_action(cx.listener(Self::find_previous))
             .on_action(cx.listener(Self::close_file))
             .bg(rgb(SHEET_BG))
             .text_color(rgb(CELL_TEXT))
@@ -1212,6 +1394,15 @@ impl Render for SpreadsheetViewer {
                 }
             })
             .child(title_bar(workbook.as_ref(), sheet_ix))
+            .when(self.search_open, |element| {
+                element.child(search_bar(
+                    &self.search_query,
+                    search_match_label(self.search_match_index, self.search_matches.len()),
+                    &self.search_focus,
+                    &self.focus_handle,
+                    &cx.entity(),
+                ))
+            })
             .child(formula_bar(
                 workbook.sheet(sheet_ix),
                 selection,
@@ -1255,6 +1446,7 @@ impl Render for SpreadsheetViewer {
                         sheet_ix,
                         &layout,
                         selection,
+                        &search_highlight,
                         &self.horizontal_scroll,
                         scrollable_column_viewport_width,
                         scrollable_row_viewport_height,
@@ -1456,6 +1648,7 @@ fn body_pane(
     sheet_ix: usize,
     layout: &SheetLayout,
     selection: Selection,
+    search: &SearchHighlight,
     horizontal_scroll: &ScrollHandle,
     scrollable_viewport_width: f32,
     scrollable_viewport_height: f32,
@@ -1517,6 +1710,7 @@ fn body_pane(
             row_horizontal_offset,
             scrollable_columns.clone(),
             selection,
+            search,
             &row_entity,
             window,
         ));
@@ -1553,6 +1747,7 @@ fn body_pane(
                     pinned_horizontal_scroll.offset().x,
                     scrollable_columns.clone(),
                     selection,
+                    search,
                     &pinned_entity,
                     window,
                 ));
@@ -2047,6 +2242,203 @@ fn formula_bar(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn search_bar(
+    search_query: &str,
+    match_label: String,
+    search_focus: &FocusHandle,
+    grid_focus: &FocusHandle,
+    entity: &Entity<SpreadsheetViewer>,
+) -> Stateful<Div> {
+    div()
+        .id("search-bar")
+        .h(px(SEARCH_BAR_HEIGHT))
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_2()
+        .py_1()
+        .px_2()
+        .bg(rgb(HEADER_BG))
+        .border_b_1()
+        .border_color(rgb(GRID_COLOR))
+        .child(div().text_color(rgb(HEADER_TEXT)).child("Find"))
+        .child(search_input(search_query, search_focus, grid_focus, entity).flex_1())
+        .child(search_nav_buttons(entity))
+        .child(
+            div()
+                .min_w(px(72.0))
+                .text_color(rgb(HEADER_TEXT))
+                .child(match_label),
+        )
+}
+
+fn search_nav_buttons(entity: &Entity<SpreadsheetViewer>) -> Div {
+    div()
+        .flex()
+        .gap_1()
+        .child(search_nav_button(
+            entity,
+            "search-prev",
+            "←",
+            SearchNavDirection::Previous,
+        ))
+        .child(search_nav_button(
+            entity,
+            "search-next",
+            "→",
+            SearchNavDirection::Next,
+        ))
+}
+
+#[derive(Clone, Copy)]
+enum SearchNavDirection {
+    Previous,
+    Next,
+}
+
+fn search_nav_button(
+    entity: &Entity<SpreadsheetViewer>,
+    id: &'static str,
+    label: &'static str,
+    direction: SearchNavDirection,
+) -> Stateful<Div> {
+    let entity = entity.clone();
+    div()
+        .id(id)
+        .w(px(24.0))
+        .h(px(24.0))
+        .flex()
+        .flex_none()
+        .items_center()
+        .justify_center()
+        .bg(rgb(CELL_BG))
+        .border_1()
+        .border_color(rgb(GRID_COLOR))
+        .text_color(rgb(HEADER_TEXT))
+        .cursor(CursorStyle::PointingHand)
+        .hover(|button| button.bg(rgb(HOVER_CELL_BG)))
+        .child(label)
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            entity.update(cx, |viewer, cx| {
+                if viewer.search_matches.is_empty() && !viewer.search_query.is_empty() {
+                    viewer.refresh_search();
+                }
+                let next_ix = match direction {
+                    SearchNavDirection::Previous => previous_search_index(
+                        viewer.search_match_index,
+                        viewer.search_matches.len(),
+                    ),
+                    SearchNavDirection::Next => {
+                        next_search_index(viewer.search_match_index, viewer.search_matches.len())
+                    }
+                };
+                if let Some(ix) = next_ix {
+                    viewer.go_to_match(ix);
+                }
+                cx.notify();
+            });
+            cx.stop_propagation();
+        })
+}
+
+fn search_input(
+    search_query: &str,
+    search_focus: &FocusHandle,
+    grid_focus: &FocusHandle,
+    entity: &Entity<SpreadsheetViewer>,
+) -> Stateful<Div> {
+    div()
+        .id("search-input")
+        .track_focus(search_focus)
+        .h(px(24.0))
+        .flex()
+        .items_center()
+        .px_2()
+        .bg(rgb(CELL_BG))
+        .border_1()
+        .border_color(rgb(SELECTION_BORDER))
+        .text_color(rgb(CELL_TEXT))
+        .cursor(CursorStyle::IBeam)
+        .on_mouse_down(MouseButton::Left, {
+            let search_focus = search_focus.clone();
+            move |_, window, cx| {
+                search_focus.focus(window);
+                cx.stop_propagation();
+            }
+        })
+        .on_key_down({
+            let entity = entity.clone();
+            let grid_focus = grid_focus.clone();
+            move |event, window, cx| {
+                if search_key_down(&entity, event, window, cx) {
+                    grid_focus.focus(window);
+                }
+                cx.stop_propagation();
+            }
+        })
+        .child(search_query.to_owned())
+        .child(div().w(px(1.0)).h(px(14.0)).bg(rgb(SELECTION_BORDER)))
+}
+
+/// Applies a search-bar keystroke. Returns `true` when the bar should close and
+/// focus return to the grid (Escape).
+fn search_key_down(
+    entity: &Entity<SpreadsheetViewer>,
+    event: &KeyDownEvent,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let key_char = event.keystroke.key_char.clone();
+    entity.update(cx, |viewer, cx| match event.keystroke.key.as_str() {
+        "escape" => {
+            viewer.close_search(window);
+            cx.notify();
+            true
+        }
+        "enter" | "return" => {
+            if event.keystroke.modifiers.shift {
+                if let Some(ix) =
+                    previous_search_index(viewer.search_match_index, viewer.search_matches.len())
+                {
+                    viewer.go_to_match(ix);
+                }
+            } else if let Some(ix) =
+                next_search_index(viewer.search_match_index, viewer.search_matches.len())
+            {
+                viewer.go_to_match(ix);
+            }
+            cx.notify();
+            false
+        }
+        "backspace" => {
+            viewer.search_query.pop();
+            viewer.refresh_search();
+            if let Some(ix) = viewer.search_match_index {
+                viewer.go_to_match(ix);
+            }
+            cx.notify();
+            false
+        }
+        _ => {
+            if let Some(text) = key_char
+                && !text.is_empty()
+                && !text.chars().any(char::is_control)
+                && text != "\n"
+                && text != "\t"
+            {
+                viewer.search_query.push_str(&text);
+                viewer.refresh_search();
+                if let Some(ix) = viewer.search_match_index {
+                    viewer.go_to_match(ix);
+                }
+                cx.notify();
+            }
+            false
+        }
+    })
+}
+
 fn name_box(
     selection_label: String,
     name_box_input: Option<String>,
@@ -2485,6 +2877,7 @@ fn render_body_row(
     horizontal_offset: Pixels,
     scrollable_columns: Range<usize>,
     selection: Selection,
+    search: &SearchHighlight,
     entity: &Entity<SpreadsheetViewer>,
     window: &mut Window,
 ) -> AnyElement {
@@ -2510,6 +2903,7 @@ fn render_body_row(
             horizontal_offset,
             scrollable_columns,
             selection,
+            search,
             entity,
             window,
         ))
@@ -2525,6 +2919,7 @@ fn render_cells_row_segments(
     horizontal_offset: Pixels,
     scrollable_columns: Range<usize>,
     selection: Selection,
+    search: &SearchHighlight,
     entity: &Entity<SpreadsheetViewer>,
     window: &mut Window,
 ) -> Div {
@@ -2539,6 +2934,7 @@ fn render_cells_row_segments(
         horizontal_offset,
         &scrollable_columns,
         selection,
+        search,
         entity,
         window,
     );
@@ -2563,6 +2959,7 @@ fn render_cells_row_segments(
                         row_ix,
                         row_height,
                         selection,
+                        search,
                         entity,
                         window,
                         0,
@@ -2584,6 +2981,7 @@ fn render_cells_row_segments(
                             row_ix,
                             row_height,
                             selection,
+                            search,
                             entity,
                             window,
                             scrollable_columns.start,
@@ -2612,6 +3010,7 @@ fn row_overlay_layer(
     horizontal_offset: Pixels,
     scrollable_columns: &Range<usize>,
     selection: Selection,
+    search: &SearchHighlight,
     entity: &Entity<SpreadsheetViewer>,
     window: &mut Window,
 ) -> Vec<Div> {
@@ -2628,12 +3027,7 @@ fn row_overlay_layer(
         }
     };
 
-    let cell_state = |coord: CellCoord| CellRenderState {
-        coord,
-        selected: selection.contains(coord.row, coord.col),
-        selection_edges: selection.range.edge_sides(coord.row, coord.col),
-        active: selection.anchor == coord,
-    };
+    let cell_state = |coord: CellCoord| cell_render_state(coord, selection, search);
 
     // Merged-cell anchors that begin on this row.
     for &region in layout.merges.regions() {
@@ -2710,14 +3104,7 @@ fn merge_overlay_cell(
     } else {
         cell.style.text_color.unwrap_or(CELL_TEXT)
     };
-    let background = {
-        let base = cell.style.background_color.unwrap_or(CELL_BG);
-        if state.selected && !state.active {
-            selection_tint(base)
-        } else {
-            base
-        }
-    };
+    let background = cell_background(cell.style.background_color.unwrap_or(CELL_BG), state);
 
     let mut element = div()
         .absolute()
@@ -2802,6 +3189,7 @@ fn render_cells_row_range(
     row_ix: usize,
     row_height: f32,
     selection: Selection,
+    search: &SearchHighlight,
     entity: &Entity<SpreadsheetViewer>,
     window: &mut Window,
     start_col: usize,
@@ -2828,12 +3216,7 @@ fn render_cells_row_range(
             row_cell,
             layout.column_width(sheet_col_ix),
             row_height,
-            CellRenderState {
-                coord: CellCoord::new(row_ix, sheet_col_ix),
-                selected: selection.contains(row_ix, sheet_col_ix),
-                selection_edges: selection.range.edge_sides(row_ix, sheet_col_ix),
-                active: selection.anchor == CellCoord::new(row_ix, sheet_col_ix),
-            },
+            cell_render_state(CellCoord::new(row_ix, sheet_col_ix), selection, search),
             overflow_widths[col_ix].is_none(),
             entity,
         ));
@@ -2843,12 +3226,7 @@ fn render_cells_row_range(
     for (col_ix, row_cell) in cells.iter().enumerate() {
         let sheet_col_ix = start_col + col_ix;
         if let Some(width) = overflow_widths[col_ix] {
-            let state = CellRenderState {
-                coord: CellCoord::new(row_ix, sheet_col_ix),
-                selected: selection.contains(row_ix, sheet_col_ix),
-                selection_edges: selection.range.edge_sides(row_ix, sheet_col_ix),
-                active: selection.anchor == CellCoord::new(row_ix, sheet_col_ix),
-            };
+            let state = cell_render_state(CellCoord::new(row_ix, sheet_col_ix), selection, search);
             row = row.child(cell_text_overlay(
                 row_cell,
                 left,
@@ -3272,14 +3650,10 @@ fn cell(
                 .border_l_0()
                 .border_t_0()
         })
-        .bg(rgb({
-            let base = cell.style.background_color.unwrap_or(CELL_BG);
-            if state.selected && !state.active {
-                selection_tint(base)
-            } else {
-                base
-            }
-        }))
+        .bg(rgb(cell_background(
+            cell.style.background_color.unwrap_or(CELL_BG),
+            state,
+        )))
         .text_color(rgb(text_color));
 
     element = if multiline {
@@ -3336,14 +3710,7 @@ fn cell_text_overlay(
     let mask_width = (row_cell.text_width + CELL_HORIZONTAL_PADDING).min(width);
     let source_mask_width = mask_width.min(source_width);
     let overflow_mask_width = (mask_width - source_width).max(0.0);
-    let source_background = {
-        let base = cell.style.background_color.unwrap_or(CELL_BG);
-        if state.selected && !state.active {
-            selection_tint(base)
-        } else {
-            base
-        }
-    };
+    let source_background = cell_background(cell.style.background_color.unwrap_or(CELL_BG), state);
     let text_color = if row_cell.formula_fallback {
         FORMULA_FALLBACK_TEXT
     } else {
@@ -4060,6 +4427,24 @@ mod tests {
 
     fn fixed_view_height() -> f32 {
         TITLE_BAR_HEIGHT + FORMULA_BAR_HEIGHT + HEADER_HEIGHT + FOOTER_HEIGHT
+    }
+
+    #[test]
+    fn search_match_label_formats_counter_and_empty_state() {
+        assert_eq!(search_match_label(None, 0), "No matches");
+        assert_eq!(search_match_label(Some(0), 3), "1 of 3");
+        assert_eq!(search_match_label(Some(2), 5), "3 of 5");
+    }
+
+    #[test]
+    fn next_and_previous_search_index_wrap_around() {
+        assert_eq!(next_search_index(None, 3), Some(0));
+        assert_eq!(next_search_index(Some(0), 3), Some(1));
+        assert_eq!(next_search_index(Some(2), 3), Some(0));
+
+        assert_eq!(previous_search_index(None, 3), Some(2));
+        assert_eq!(previous_search_index(Some(0), 3), Some(2));
+        assert_eq!(previous_search_index(Some(1), 3), Some(0));
     }
 
     fn assert_float_eq(left: f32, right: f32) {

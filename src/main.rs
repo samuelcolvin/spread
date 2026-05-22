@@ -17,7 +17,9 @@ use gpui::{
 };
 
 use crate::{
-    view::{CopySelection, SpreadsheetViewer, WINDOW_HEIGHT, WINDOW_WIDTH},
+    view::{
+        CopySelection, Find, FindNext, FindPrevious, SpreadsheetViewer, WINDOW_HEIGHT, WINDOW_WIDTH,
+    },
     workbook::load_workbook,
 };
 
@@ -183,11 +185,12 @@ fn run(cli: &Cli) -> Result<()> {
             return;
         }
 
-        cx.bind_keys([KeyBinding::new(
-            "cmd-c",
-            CopySelection,
-            Some("SpreadsheetViewer"),
-        )]);
+        cx.bind_keys([
+            KeyBinding::new("cmd-c", CopySelection, Some("SpreadsheetViewer")),
+            KeyBinding::new("cmd-f", Find, Some("SpreadsheetViewer")),
+            KeyBinding::new("cmd-g", FindNext, Some("SpreadsheetViewer")),
+            KeyBinding::new("cmd-shift-g", FindPrevious, Some("SpreadsheetViewer")),
+        ]);
         cx.bind_keys([KeyBinding::new("cmd-o", OpenDocument, None)]);
         cx.bind_keys([KeyBinding::new("cmd-q", CloseFile, None)]);
         let open_dialog_show_splash_after_document_close =
@@ -220,6 +223,16 @@ fn run(cli: &Cli) -> Result<()> {
                     MenuItem::action("Open...", OpenDocument),
                     MenuItem::separator(),
                     MenuItem::action("Close File", CloseFile),
+                ],
+            },
+            Menu {
+                name: "Edit".into(),
+                items: vec![
+                    MenuItem::action("Copy", CopySelection),
+                    MenuItem::separator(),
+                    MenuItem::action("Find...", Find),
+                    MenuItem::action("Find Next", FindNext),
+                    MenuItem::action("Find Previous", FindPrevious),
                 ],
             },
         ]);

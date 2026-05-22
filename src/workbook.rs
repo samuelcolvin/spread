@@ -476,6 +476,49 @@ impl SheetData {
             SheetRowLayout::Explicit { heights } => heights.into_iter().sum(),
         }
     }
+
+    /// Row-major list of cells whose displayed value contains `query` (ASCII
+    /// case-insensitive). Covered merge cells report their anchor once.
+    pub(crate) fn find_display_matches(&self, query: &str) -> Vec<CellCoord> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+
+        let mut matches = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+
+        for row_ix in 0..self.row_count() {
+            for col_ix in 0..self.col_count() {
+                let anchor = self
+                    .merges
+                    .covered_anchor(row_ix, col_ix)
+                    .unwrap_or(CellCoord::new(row_ix, col_ix));
+                let value = self.cell_data(anchor.row, anchor.col).value;
+                if value.is_empty() || !ascii_contains_ignore_case(&value, query) {
+                    continue;
+                }
+                if seen.insert((anchor.row, anchor.col)) {
+                    matches.push(anchor);
+                }
+            }
+        }
+
+        matches
+    }
+}
+
+fn ascii_contains_ignore_case(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+
+    haystack.as_bytes().windows(needle.len()).any(|window| {
+        window
+            .iter()
+            .zip(needle.bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(&b))
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2126,6 +2169,154 @@ mod tests {
         assert!(range.edge_sides(2, 3).right());
         assert!(!range.edge_sides(2, 2).any());
         assert!(!range.edge_sides(4, 2).any());
+    }
+
+    #[test]
+    fn find_display_matches_is_case_insensitive() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![vec![CellData {
+                value: "Hello World".to_owned(),
+                ..Default::default()
+            }]],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        assert_eq!(
+            sheet.find_display_matches("hello"),
+            vec![CellCoord::new(0, 0)]
+        );
+        assert_eq!(
+            sheet.find_display_matches("WORLD"),
+            vec![CellCoord::new(0, 0)]
+        );
+    }
+
+    #[test]
+    fn find_display_matches_finds_partial_substrings() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![vec![
+                CellData {
+                    value: "alpha".to_owned(),
+                    ..Default::default()
+                },
+                CellData {
+                    value: "alphabet".to_owned(),
+                    ..Default::default()
+                },
+            ]],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        assert_eq!(
+            sheet.find_display_matches("pha"),
+            vec![CellCoord::new(0, 0), CellCoord::new(0, 1)]
+        );
+    }
+
+    #[test]
+    fn find_display_matches_returns_empty_for_blank_query() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![vec![CellData {
+                value: "text".to_owned(),
+                ..Default::default()
+            }]],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        assert!(sheet.find_display_matches("").is_empty());
+        assert!(sheet.find_display_matches("   ").is_empty());
+    }
+
+    #[test]
+    fn find_display_matches_skips_empty_display_values() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![vec![
+                CellData::default(),
+                CellData {
+                    value: "hit".to_owned(),
+                    ..Default::default()
+                },
+            ]],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        assert_eq!(
+            sheet.find_display_matches("hit"),
+            vec![CellCoord::new(0, 1)]
+        );
+    }
+
+    #[test]
+    fn find_display_matches_returns_row_major_order() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![
+                vec![
+                    CellData {
+                        value: "x".to_owned(),
+                        ..Default::default()
+                    },
+                    CellData::default(),
+                ],
+                vec![CellData {
+                    value: "x".to_owned(),
+                    ..Default::default()
+                }],
+            ],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        assert_eq!(
+            sheet.find_display_matches("x"),
+            vec![CellCoord::new(0, 0), CellCoord::new(1, 0)]
+        );
+    }
+
+    #[test]
+    fn find_display_matches_reports_merge_anchor_not_covered_cell() {
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![vec![
+                CellData {
+                    value: "merged".to_owned(),
+                    ..Default::default()
+                },
+                CellData::default(),
+                CellData::default(),
+            ]],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        )
+        .with_merges(SheetMerges::from_ranges([CellRange::new(
+            CellCoord::new(0, 0),
+            CellCoord::new(0, 2),
+        )]));
+
+        assert_eq!(
+            sheet.find_display_matches("merged"),
+            vec![CellCoord::new(0, 0)]
+        );
     }
 
     fn temp_file(name: &str) -> PathBuf {

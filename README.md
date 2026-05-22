@@ -16,6 +16,7 @@ Features:
 - supports CSV, Parquet, and XLSX file formats
 - loads 30M row Parquet files in 100ms
 - supports copy and paste to Google sheets or excel
+- in-sheet search via Cmd+F (find next/previous with Cmd+G / Cmd+Shift+G)
 - displays formatting such as dates, currency, percentages, bold text, colors, and column/row dimensions
 - `--display xml` mode from the CLI to make it easy for LLMs to "view" spreadsheets
 
