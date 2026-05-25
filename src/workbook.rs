@@ -658,6 +658,80 @@ impl SheetData {
         summary
     }
 
+    /// Aggregate `summary_for_range` across multiple ranges, deduplicating
+    /// overlapping cells so each is counted exactly once. Falls back to the
+    /// single-range fast path when there's only one range so the precomputed
+    /// summary for lazy sheets keeps working.
+    pub(crate) fn summary_for_ranges(&self, ranges: &[CellRange]) -> SelectionSummary {
+        if ranges.is_empty() {
+            return SelectionSummary::default();
+        }
+        if ranges.len() == 1 {
+            return self.summary_for_range(ranges[0]);
+        }
+
+        debug_assert!(self.supports_full_range_operations());
+        let mut summary = SelectionSummary::default();
+        let mut seen = std::collections::HashSet::new();
+        for range in ranges {
+            let range = range.normalized();
+            for row_ix in range.start.row..=range.end.row {
+                for col_ix in range.start.col..=range.end.col {
+                    if !seen.insert((row_ix, col_ix)) {
+                        continue;
+                    }
+                    summary.selected_cells += 1;
+                    if let Some(value) = self.numeric_value(row_ix, col_ix) {
+                        summary.numeric_cells += 1;
+                        summary.sum += value;
+                        summary.min = Some(summary.min.map_or(value, |min| min.min(value)));
+                        summary.max = Some(summary.max.map_or(value, |max| max.max(value)));
+                    }
+                }
+            }
+        }
+        summary
+    }
+
+    /// Multi-range counterpart of `common_numeric_format_in_range`. Returns
+    /// `None` if any numeric cell across the deduplicated union has a
+    /// different (or missing) format.
+    pub(crate) fn common_numeric_format_in_ranges(
+        &self,
+        ranges: &[CellRange],
+    ) -> Option<CellDisplayFormat> {
+        if !self.is_fully_loaded() || ranges.is_empty() {
+            return None;
+        }
+        if ranges.len() == 1 {
+            return self.common_numeric_format_in_range(ranges[0]);
+        }
+
+        let mut shared: Option<CellDisplayFormat> = None;
+        let mut seen = std::collections::HashSet::new();
+        for range in ranges {
+            let range = range.normalized();
+            for row_ix in range.start.row..=range.end.row {
+                for col_ix in range.start.col..=range.end.col {
+                    if !seen.insert((row_ix, col_ix)) {
+                        continue;
+                    }
+                    if self.numeric_value(row_ix, col_ix).is_none() {
+                        continue;
+                    }
+                    let cell = self.cell_data(row_ix, col_ix);
+                    let format = cell.display_format?;
+                    match &shared {
+                        Some(existing) if existing != &format => return None,
+                        Some(_) => {}
+                        None => shared = Some(format),
+                    }
+                }
+            }
+        }
+        shared
+    }
+
     /// Display format shared by every numeric cell in `range`. Returns `None`
     /// if the cells disagree, none are numeric, or the sheet isn't fully loaded
     /// (in which case we don't have per-cell formats without forcing a load).
@@ -1184,6 +1258,10 @@ impl SelectionEdgeSides {
 
     pub(crate) fn any(self) -> bool {
         self.0 != 0
+    }
+
+    pub(crate) fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 }
 
@@ -2099,6 +2177,50 @@ mod tests {
         assert!((summary.sum - 4.0).abs() < f64::EPSILON);
         assert_eq!(summary.min, Some(1.0));
         assert_eq!(summary.max, Some(3.0));
+    }
+
+    #[test]
+    fn summary_for_ranges_dedupes_overlapping_cells() {
+        let numeric = |raw: f64| CellData {
+            value: format!("{raw}"),
+            raw_value: CellRawValue::Number(raw),
+            ..Default::default()
+        };
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![
+                vec![numeric(1.0), numeric(2.0), numeric(3.0)],
+                vec![numeric(4.0), numeric(5.0), numeric(6.0)],
+                vec![numeric(7.0), numeric(8.0), numeric(9.0)],
+            ],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        // (0,0)..(1,1) overlaps (1,1)..(2,2) at cell (1,1). The overlap must be
+        // counted exactly once.
+        let summary = sheet.summary_for_ranges(&[
+            CellRange::new(CellCoord::new(0, 0), CellCoord::new(1, 1)),
+            CellRange::new(CellCoord::new(1, 1), CellCoord::new(2, 2)),
+        ]);
+        assert_eq!(summary.selected_cells, 7);
+        assert_eq!(summary.numeric_cells, 7);
+        // 1+2+4+5 + 6+8+9 (5 is the shared cell, only counted once).
+        assert!((summary.sum - 35.0).abs() < f64::EPSILON);
+        assert_eq!(summary.min, Some(1.0));
+        assert_eq!(summary.max, Some(9.0));
+
+        // Single-range delegates to summary_for_range, no dedupe needed.
+        let single =
+            sheet.summary_for_ranges(&[CellRange::new(CellCoord::new(0, 0), CellCoord::new(0, 2))]);
+        assert_eq!(single.selected_cells, 3);
+        assert!((single.sum - 6.0).abs() < f64::EPSILON);
+
+        // Empty input returns the default summary.
+        let empty = sheet.summary_for_ranges(&[]);
+        assert_eq!(empty, SelectionSummary::default());
     }
 
     #[test]

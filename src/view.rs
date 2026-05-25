@@ -135,6 +135,11 @@ pub(crate) struct SpreadsheetViewer {
     scrollable_viewport: (f32, f32),
     active_sheet: usize,
     selection: Selection,
+    /// Additional ranges added via cmd-click for non-contiguous selection.
+    /// The "active" range — the one with the anchor and the one that drag,
+    /// shift-extend, and arrow keys move — is `selection.range`. These extras
+    /// are display-only ranges (highlighted, counted in the summary, etc.).
+    extra_ranges: Vec<CellRange>,
     selection_drag: Option<CellCoord>,
     summary_metric: SummaryMetric,
     show_summary_menu: bool,
@@ -219,6 +224,45 @@ impl Selection {
 
     fn contains(self, row: usize, col: usize) -> bool {
         self.range.contains(row, col)
+    }
+}
+
+/// Bundled view of the active selection plus any cmd-click extras, for
+/// rendering. `Copy` so it threads through the existing render helpers the
+/// same way the bare `Selection` used to.
+#[derive(Clone, Copy)]
+struct SelectionView<'a> {
+    active: Selection,
+    extras: &'a [CellRange],
+}
+
+impl<'a> SelectionView<'a> {
+    fn new(active: Selection, extras: &'a [CellRange]) -> Self {
+        Self { active, extras }
+    }
+
+    fn anchor(self) -> CellCoord {
+        self.active.anchor
+    }
+
+    fn contains(self, row: usize, col: usize) -> bool {
+        self.active.contains(row, col) || self.extras.iter().any(|r| r.contains(row, col))
+    }
+
+    fn edges_at(self, row: usize, col: usize) -> SelectionEdgeSides {
+        let mut edges = self.active.range.edge_sides(row, col);
+        for range in self.extras {
+            edges = edges.union(range.edge_sides(row, col));
+        }
+        edges
+    }
+
+    fn intersects_row(self, row: usize) -> bool {
+        self.active.range.intersects_row(row) || self.extras.iter().any(|r| r.intersects_row(row))
+    }
+
+    fn intersects_col(self, col: usize) -> bool {
+        self.active.range.intersects_col(col) || self.extras.iter().any(|r| r.intersects_col(col))
     }
 }
 
@@ -820,6 +864,7 @@ impl SpreadsheetViewer {
             scrollable_viewport: (0.0, 0.0),
             active_sheet,
             selection: Selection::single(CellCoord::new(0, 0)),
+            extra_ranges: Vec::new(),
             selection_drag: None,
             summary_metric: SummaryMetric::Sum,
             show_summary_menu: false,
@@ -988,6 +1033,7 @@ impl SpreadsheetViewer {
             state.current_match = Some(coord);
             state.no_results = false;
             self.selection = Selection::single(coord);
+            self.extra_ranges.clear();
             self.scroll_to_cell_centered(coord);
         } else {
             state.current_match = None;
@@ -1017,6 +1063,7 @@ impl SpreadsheetViewer {
 
         self.active_sheet = sheet_ix;
         self.selection = Selection::single(CellCoord::new(0, 0));
+        self.extra_ranges.clear();
         self.name_box_input = None;
         self.name_box_select_all = false;
         self.selection_drag = None;
@@ -1036,15 +1083,24 @@ impl SpreadsheetViewer {
             .unwrap_or(coord)
     }
 
-    fn select_cell(&mut self, coord: CellCoord, extend: bool) -> bool {
+    fn select_cell(&mut self, coord: CellCoord, extend: bool, add: bool) -> bool {
         let coord = self.merge_anchor_coord(coord);
-        let next_selection = if extend {
-            self.selection.extend_to(coord)
+        // cmd takes precedence over shift: cmd-click always starts a new
+        // non-contiguous range, whereas shift-click extends the active one.
+        let (next_selection, next_extras) = if add {
+            let mut extras = self.extra_ranges.clone();
+            extras.push(self.selection.range);
+            (Selection::single(coord), extras)
+        } else if extend {
+            (self.selection.extend_to(coord), self.extra_ranges.clone())
         } else {
-            Selection::single(coord)
+            (Selection::single(coord), Vec::new())
         };
-        let changed = self.selection != next_selection || self.show_summary_menu;
+        let changed = self.selection != next_selection
+            || self.extra_ranges != next_extras
+            || self.show_summary_menu;
         self.selection = next_selection;
+        self.extra_ranges = next_extras;
         self.selection_drag = Some(self.selection.anchor);
         self.resize_drag = None;
         self.show_summary_menu = false;
@@ -1066,34 +1122,54 @@ impl SpreadsheetViewer {
         false
     }
 
-    fn select_col(&mut self, col: usize, extend: bool) -> bool {
+    fn select_col(&mut self, col: usize, extend: bool, add: bool) -> bool {
         let max_row = self.active_sheet().row_count().saturating_sub(1);
-        let anchor_col = if extend {
+        let anchor_col = if extend && !add {
             self.selection.anchor.col
         } else {
             col
         };
         let next_selection =
             Selection::select_range(CellCoord::new(0, anchor_col), CellCoord::new(max_row, col));
-        let changed = self.selection != next_selection || self.show_summary_menu;
+        let next_extras = if add {
+            let mut extras = self.extra_ranges.clone();
+            extras.push(self.selection.range);
+            extras
+        } else {
+            Vec::new()
+        };
+        let changed = self.selection != next_selection
+            || self.extra_ranges != next_extras
+            || self.show_summary_menu;
         self.selection = next_selection;
+        self.extra_ranges = next_extras;
         self.selection_drag = None;
         self.resize_drag = None;
         self.show_summary_menu = false;
         changed
     }
 
-    fn select_row(&mut self, row: usize, extend: bool) -> bool {
+    fn select_row(&mut self, row: usize, extend: bool, add: bool) -> bool {
         let max_col = self.active_sheet().col_count().saturating_sub(1);
-        let anchor_row = if extend {
+        let anchor_row = if extend && !add {
             self.selection.anchor.row
         } else {
             row
         };
         let next_selection =
             Selection::select_range(CellCoord::new(anchor_row, 0), CellCoord::new(row, max_col));
-        let changed = self.selection != next_selection || self.show_summary_menu;
+        let next_extras = if add {
+            let mut extras = self.extra_ranges.clone();
+            extras.push(self.selection.range);
+            extras
+        } else {
+            Vec::new()
+        };
+        let changed = self.selection != next_selection
+            || self.extra_ranges != next_extras
+            || self.show_summary_menu;
         self.selection = next_selection;
+        self.extra_ranges = next_extras;
         self.selection_drag = None;
         self.resize_drag = None;
         self.show_summary_menu = false;
@@ -1106,8 +1182,11 @@ impl SpreadsheetViewer {
         let max_col = sheet.col_count().saturating_sub(1);
         let next_selection =
             Selection::select_range(CellCoord::new(0, 0), CellCoord::new(max_row, max_col));
-        let changed = self.selection != next_selection || self.show_summary_menu;
+        let changed = self.selection != next_selection
+            || !self.extra_ranges.is_empty()
+            || self.show_summary_menu;
         self.selection = next_selection;
+        self.extra_ranges.clear();
         self.selection_drag = None;
         self.resize_drag = None;
         self.show_summary_menu = false;
@@ -1117,15 +1196,15 @@ impl SpreadsheetViewer {
     fn apply_name_ref(&mut self, name_ref: NameRef) {
         let center_on = match name_ref {
             NameRef::Cell(coord) => {
-                self.select_cell(coord, false);
+                self.select_cell(coord, false, false);
                 coord
             }
             NameRef::Column(col) => {
-                self.select_col(col, false);
+                self.select_col(col, false, false);
                 CellCoord::new(0, col)
             }
             NameRef::Row(row) => {
-                self.select_row(row, false);
+                self.select_row(row, false, false);
                 CellCoord::new(row, 0)
             }
         };
@@ -1154,14 +1233,25 @@ impl SpreadsheetViewer {
         } else {
             Selection::single(target)
         };
-        let changed = self.selection != next_selection || self.show_summary_menu;
+        let changed = self.selection != next_selection
+            || !self.extra_ranges.is_empty()
+            || self.show_summary_menu;
         self.selection = next_selection;
+        self.extra_ranges.clear();
         self.selection_drag = None;
         self.show_summary_menu = false;
         self.scroll_to_cell_visible(target);
         if changed {
             cx.notify();
         }
+    }
+
+    /// Active selection plus any cmd-click extras, in a single slice-friendly
+    /// allocation. Used by the summary and shared-format computations.
+    fn all_selected_ranges(&self) -> Vec<CellRange> {
+        let mut ranges = self.extra_ranges.clone();
+        ranges.push(self.selection.range);
+        ranges
     }
 
     /// When `coord` sits inside a merge region, return the edge cell in the
@@ -1463,6 +1553,7 @@ impl Render for SpreadsheetViewer {
         let workbook = Arc::clone(&self.workbook);
         let sheet_ix = self.active_sheet;
         let selection = self.selection;
+        let selection_view = SelectionView::new(self.selection, &self.extra_ranges);
         let layout = self.active_layout().clone();
         let formula_height = formula_bar_height_for_sheet(workbook.sheet(sheet_ix), selection);
         let window_size = window.bounds().size;
@@ -1606,7 +1697,7 @@ impl Render for SpreadsheetViewer {
                         &workbook,
                         sheet_ix,
                         &layout,
-                        selection,
+                        selection_view,
                         &self.horizontal_scroll,
                         scrollable_column_viewport_width,
                         &cx.entity(),
@@ -1629,7 +1720,7 @@ impl Render for SpreadsheetViewer {
                         &workbook,
                         sheet_ix,
                         &layout,
-                        selection,
+                        selection_view,
                         &self.horizontal_scroll,
                         scrollable_column_viewport_width,
                         scrollable_row_viewport_height,
@@ -1753,7 +1844,7 @@ fn column_header_pane(
     workbook: &Arc<WorkbookData>,
     sheet_ix: usize,
     layout: &SheetLayout,
-    selection: Selection,
+    selection: SelectionView<'_>,
     horizontal_scroll: &ScrollHandle,
     scrollable_viewport_width: f32,
     entity: &Entity<SpreadsheetViewer>,
@@ -1830,7 +1921,7 @@ fn body_pane(
     workbook: &Arc<WorkbookData>,
     sheet_ix: usize,
     layout: &SheetLayout,
-    selection: Selection,
+    selection: SelectionView<'_>,
     horizontal_scroll: &ScrollHandle,
     scrollable_viewport_width: f32,
     scrollable_viewport_height: f32,
@@ -2975,8 +3066,9 @@ fn sheet_tabs(viewer: &SpreadsheetViewer, entity: &Entity<SpreadsheetViewer>) ->
 
 fn summary_box(viewer: &SpreadsheetViewer, entity: &Entity<SpreadsheetViewer>) -> Div {
     let sheet = viewer.active_sheet();
-    let summary = sheet.summary_for_range(viewer.selection.range);
-    let shared_format = sheet.common_numeric_format_in_range(viewer.selection.range);
+    let ranges = viewer.all_selected_ranges();
+    let summary = sheet.summary_for_ranges(&ranges);
+    let shared_format = sheet.common_numeric_format_in_ranges(&ranges);
     let metric_value = summary_metric_value(summary, viewer.summary_metric, shared_format.as_ref());
     let main_entity: Entity<SpreadsheetViewer> = (*entity).clone();
     let mut box_el = div()
@@ -3120,7 +3212,7 @@ fn render_body_row(
     row_ix: usize,
     horizontal_offset: Pixels,
     scrollable_columns: Range<usize>,
-    selection: Selection,
+    selection: SelectionView<'_>,
     entity: &Entity<SpreadsheetViewer>,
     window: &mut Window,
 ) -> AnyElement {
@@ -3135,7 +3227,7 @@ fn render_body_row(
             row_ix,
             row_height,
             layout.row_header_width,
-            selection.range.intersects_row(row_ix),
+            selection.intersects_row(row_ix),
             entity,
         ))
         .child(render_cells_row_segments(
@@ -3160,7 +3252,7 @@ fn render_cells_row_segments(
     row_height: f32,
     horizontal_offset: Pixels,
     scrollable_columns: Range<usize>,
-    selection: Selection,
+    selection: SelectionView<'_>,
     entity: &Entity<SpreadsheetViewer>,
     window: &mut Window,
 ) -> Div {
@@ -3247,7 +3339,7 @@ fn row_overlay_layer(
     row_height: f32,
     horizontal_offset: Pixels,
     scrollable_columns: &Range<usize>,
-    selection: Selection,
+    selection: SelectionView<'_>,
     entity: &Entity<SpreadsheetViewer>,
     window: &mut Window,
 ) -> Vec<Div> {
@@ -3267,8 +3359,8 @@ fn row_overlay_layer(
     let cell_state = |coord: CellCoord| CellRenderState {
         coord,
         selected: selection.contains(coord.row, coord.col),
-        selection_edges: selection.range.edge_sides(coord.row, coord.col),
-        active: selection.anchor == coord,
+        selection_edges: selection.edges_at(coord.row, coord.col),
+        active: selection.anchor() == coord,
     };
 
     // Merged-cell anchors that begin on this row.
@@ -3399,7 +3491,8 @@ fn merge_overlay_cell(
     element
         .on_mouse_down(MouseButton::Left, move |event, _, cx| {
             select_entity.update(cx, |viewer, cx| {
-                if viewer.select_cell(state.coord, event.modifiers.shift) {
+                if viewer.select_cell(state.coord, event.modifiers.shift, event.modifiers.platform)
+                {
                     cx.notify();
                 }
             });
@@ -3449,7 +3542,7 @@ fn render_cells_row_range(
     layout: &SheetLayout,
     row_ix: usize,
     row_height: f32,
-    selection: Selection,
+    selection: SelectionView<'_>,
     entity: &Entity<SpreadsheetViewer>,
     window: &mut Window,
     start_col: usize,
@@ -3479,8 +3572,8 @@ fn render_cells_row_range(
             CellRenderState {
                 coord: CellCoord::new(row_ix, sheet_col_ix),
                 selected: selection.contains(row_ix, sheet_col_ix),
-                selection_edges: selection.range.edge_sides(row_ix, sheet_col_ix),
-                active: selection.anchor == CellCoord::new(row_ix, sheet_col_ix),
+                selection_edges: selection.edges_at(row_ix, sheet_col_ix),
+                active: selection.anchor() == CellCoord::new(row_ix, sheet_col_ix),
             },
             overflow_widths[col_ix].is_none(),
             entity,
@@ -3494,8 +3587,8 @@ fn render_cells_row_range(
             let state = CellRenderState {
                 coord: CellCoord::new(row_ix, sheet_col_ix),
                 selected: selection.contains(row_ix, sheet_col_ix),
-                selection_edges: selection.range.edge_sides(row_ix, sheet_col_ix),
-                active: selection.anchor == CellCoord::new(row_ix, sheet_col_ix),
+                selection_edges: selection.edges_at(row_ix, sheet_col_ix),
+                active: selection.anchor() == CellCoord::new(row_ix, sheet_col_ix),
             };
             row = row.child(cell_text_overlay(
                 row_cell,
@@ -3680,7 +3773,7 @@ fn column_headers_range(
     workbook: &WorkbookData,
     sheet_ix: usize,
     layout: &SheetLayout,
-    selection: Selection,
+    selection: SelectionView<'_>,
     entity: &Entity<SpreadsheetViewer>,
     start_col: usize,
     end_col: usize,
@@ -3697,7 +3790,7 @@ fn column_headers_range(
             column_name(col_ix),
             layout.column_width(col_ix),
             col_ix,
-            selection.range.intersects_col(col_ix),
+            selection.intersects_col(col_ix),
             entity,
         ));
     }
@@ -3766,7 +3859,7 @@ fn column_header(
         )
         .on_mouse_down(MouseButton::Left, move |event, _, cx| {
             entity.update(cx, |viewer, cx| {
-                if viewer.select_col(col_ix, event.modifiers.shift) {
+                if viewer.select_col(col_ix, event.modifiers.shift, event.modifiers.platform) {
                     cx.notify();
                 }
             });
@@ -3871,7 +3964,7 @@ fn row_header(
         )
         .on_mouse_down(MouseButton::Left, move |event, _, cx| {
             entity.update(cx, |viewer, cx| {
-                if viewer.select_row(row_ix, event.modifiers.shift) {
+                if viewer.select_row(row_ix, event.modifiers.shift, event.modifiers.platform) {
                     cx.notify();
                 }
             });
@@ -3966,7 +4059,8 @@ fn cell(
     element
         .on_mouse_down(MouseButton::Left, move |event, _, cx| {
             entity.update(cx, |viewer, cx| {
-                if viewer.select_cell(state.coord, event.modifiers.shift) {
+                if viewer.select_cell(state.coord, event.modifiers.shift, event.modifiers.platform)
+                {
                     cx.notify();
                 }
             });
