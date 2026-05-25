@@ -76,7 +76,21 @@ fn selection_tint(base: u32) -> u32 {
     (channel(16) << 16) | (channel(8) << 8) | channel(0)
 }
 
-actions!(spreadsheet_viewer, [CopySelection, OpenSearch]);
+actions!(
+    spreadsheet_viewer,
+    [
+        CopySelection,
+        OpenSearch,
+        MoveUp,
+        MoveDown,
+        MoveLeft,
+        MoveRight,
+        ExtendUp,
+        ExtendDown,
+        ExtendLeft,
+        ExtendRight,
+    ]
+);
 
 /// Registers the key bindings that target the spreadsheet viewer's
 /// `key_context`. Called once from `main.rs` during app startup so the keymap
@@ -85,7 +99,23 @@ pub(crate) fn bind_viewer_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-c", CopySelection, Some("SpreadsheetViewer")),
         KeyBinding::new("cmd-f", OpenSearch, Some("SpreadsheetViewer")),
+        KeyBinding::new("up", MoveUp, Some("SpreadsheetViewer")),
+        KeyBinding::new("down", MoveDown, Some("SpreadsheetViewer")),
+        KeyBinding::new("left", MoveLeft, Some("SpreadsheetViewer")),
+        KeyBinding::new("right", MoveRight, Some("SpreadsheetViewer")),
+        KeyBinding::new("shift-up", ExtendUp, Some("SpreadsheetViewer")),
+        KeyBinding::new("shift-down", ExtendDown, Some("SpreadsheetViewer")),
+        KeyBinding::new("shift-left", ExtendLeft, Some("SpreadsheetViewer")),
+        KeyBinding::new("shift-right", ExtendRight, Some("SpreadsheetViewer")),
     ]);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MoveDir {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 pub(crate) struct SpreadsheetViewer {
@@ -723,6 +753,17 @@ fn freeze_target_for_sizes(position: f32, sizes: impl IntoIterator<Item = f32>) 
     count
 }
 
+fn step_coord(coord: CellCoord, dir: MoveDir, rows: usize, cols: usize) -> CellCoord {
+    let max_row = rows.saturating_sub(1);
+    let max_col = cols.saturating_sub(1);
+    match dir {
+        MoveDir::Up => CellCoord::new(coord.row.saturating_sub(1), coord.col),
+        MoveDir::Down => CellCoord::new((coord.row + 1).min(max_row), coord.col),
+        MoveDir::Left => CellCoord::new(coord.row, coord.col.saturating_sub(1)),
+        MoveDir::Right => CellCoord::new(coord.row, (coord.col + 1).min(max_col)),
+    }
+}
+
 fn vertical_scroll_drag_update_interval(is_fully_loaded: bool) -> Duration {
     if is_fully_loaded {
         VERTICAL_SCROLL_DRAG_UPDATE_INTERVAL
@@ -1090,6 +1131,112 @@ impl SpreadsheetViewer {
         self.scroll_to_cell_centered(center_on);
     }
 
+    fn move_selection(&mut self, dir: MoveDir, extend: bool, cx: &mut Context<'_, Self>) {
+        let sheet = self.active_sheet();
+        let rows = sheet.row_count();
+        let cols = sheet.col_count();
+        if rows == 0 || cols == 0 {
+            return;
+        }
+
+        let from = if extend {
+            self.selection.range.end
+        } else {
+            self.selection.anchor
+        };
+        let origin = self.move_origin(from, dir);
+        let stepped = step_coord(origin, dir, rows, cols);
+        let target = self.merge_anchor_coord(stepped);
+
+        let next_selection = if extend {
+            self.selection.extend_to(target)
+        } else {
+            Selection::single(target)
+        };
+        let changed = self.selection != next_selection || self.show_summary_menu;
+        self.selection = next_selection;
+        self.selection_drag = None;
+        self.show_summary_menu = false;
+        self.scroll_to_cell_visible(target);
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// When `coord` sits inside a merge region, return the edge cell in the
+    /// direction of travel so the next step actually leaves the region instead
+    /// of bouncing back to the same anchor.
+    fn move_origin(&self, coord: CellCoord, dir: MoveDir) -> CellCoord {
+        let layout = self.active_layout();
+        let range = layout.merge_anchor(coord.row, coord.col).or_else(|| {
+            layout
+                .merge_covered_anchor(coord.row, coord.col)
+                .and_then(|anchor| layout.merge_anchor(anchor.row, anchor.col))
+        });
+        let Some(range) = range else {
+            return coord;
+        };
+        let range = range.normalized();
+        match dir {
+            MoveDir::Up => CellCoord::new(range.start.row, coord.col),
+            MoveDir::Down => CellCoord::new(range.end.row, coord.col),
+            MoveDir::Left => CellCoord::new(coord.row, range.start.col),
+            MoveDir::Right => CellCoord::new(coord.row, range.end.col),
+        }
+    }
+
+    /// Scroll the minimum amount needed to bring `coord` into view, leaving the
+    /// viewport untouched if the cell is already visible (or is inside the
+    /// pinned region, which never scrolls).
+    fn scroll_to_cell_visible(&mut self, coord: CellCoord) {
+        let (viewport_width, viewport_height) = self.scrollable_viewport;
+        let (pinned_columns, pinned_rows, col_left, col_width, row_top, row_height) = {
+            let layout = self.active_layout();
+            (
+                layout.pinned_columns,
+                layout.pinned_rows,
+                layout.columns_width(layout.pinned_columns, coord.col),
+                layout.column_width(coord.col),
+                layout.scrollable_row_top(coord.row),
+                layout.row_height(coord.row),
+            )
+        };
+
+        if coord.col >= pinned_columns && viewport_width > 0.0 {
+            let current_x = f32::from(-self.horizontal_scroll.offset().x);
+            let col_right = col_left + col_width;
+            let new_x = if col_left < current_x {
+                col_left
+            } else if col_right > current_x + viewport_width {
+                (col_right - viewport_width).max(0.0)
+            } else {
+                current_x
+            };
+            if (new_x - current_x).abs() > f32::EPSILON {
+                let max_x = self.horizontal_scroll.max_offset().width;
+                let clamped = px(new_x).min(max_x).max(px(0.0));
+                let current_y = self.horizontal_scroll.offset().y;
+                self.horizontal_scroll
+                    .set_offset(point(-clamped, current_y));
+            }
+        }
+
+        if coord.row >= pinned_rows && viewport_height > 0.0 {
+            let current_y = self.vertical_offset;
+            let row_bottom = row_top + row_height;
+            let new_y = if row_top < current_y {
+                row_top
+            } else if row_bottom > current_y + viewport_height {
+                (row_bottom - viewport_height).max(0.0)
+            } else {
+                current_y
+            };
+            if (new_y - current_y).abs() > f32::EPSILON {
+                self.set_vertical_offset(new_y, viewport_height);
+            }
+        }
+    }
+
     fn scroll_to_cell_centered(&mut self, coord: CellCoord) {
         let (viewport_width, viewport_height) = self.scrollable_viewport;
         let (row_top, row_height, col_left, col_width) = {
@@ -1378,6 +1525,30 @@ impl Render for SpreadsheetViewer {
             .on_action(cx.listener(Self::copy_selection))
             .on_action(cx.listener(Self::open_search))
             .on_action(cx.listener(Self::close_file))
+            .on_action(cx.listener(|viewer, _: &MoveUp, _, cx| {
+                viewer.move_selection(MoveDir::Up, false, cx);
+            }))
+            .on_action(cx.listener(|viewer, _: &MoveDown, _, cx| {
+                viewer.move_selection(MoveDir::Down, false, cx);
+            }))
+            .on_action(cx.listener(|viewer, _: &MoveLeft, _, cx| {
+                viewer.move_selection(MoveDir::Left, false, cx);
+            }))
+            .on_action(cx.listener(|viewer, _: &MoveRight, _, cx| {
+                viewer.move_selection(MoveDir::Right, false, cx);
+            }))
+            .on_action(cx.listener(|viewer, _: &ExtendUp, _, cx| {
+                viewer.move_selection(MoveDir::Up, true, cx);
+            }))
+            .on_action(cx.listener(|viewer, _: &ExtendDown, _, cx| {
+                viewer.move_selection(MoveDir::Down, true, cx);
+            }))
+            .on_action(cx.listener(|viewer, _: &ExtendLeft, _, cx| {
+                viewer.move_selection(MoveDir::Left, true, cx);
+            }))
+            .on_action(cx.listener(|viewer, _: &ExtendRight, _, cx| {
+                viewer.move_selection(MoveDir::Right, true, cx);
+            }))
             .bg(rgb(SHEET_BG))
             .text_color(rgb(CELL_TEXT))
             .text_size(px(12.0))
