@@ -16,8 +16,9 @@ use gpui::{
 use crate::{
     CloseFile,
     workbook::{
-        CellBorders, CellCoord, CellData, CellRange, CellRawValue, SearchDirection,
-        SelectionEdgeSides, SheetData, SheetMerges, SheetRowLayout, WorkbookData, find_next_match,
+        CellBorders, CellCoord, CellData, CellDisplayFormat, CellRange, CellRawValue,
+        SearchDirection, SelectionEdgeSides, SheetData, SheetMerges, SheetRowLayout, WorkbookData,
+        find_next_match,
     },
 };
 
@@ -2973,10 +2974,10 @@ fn sheet_tabs(viewer: &SpreadsheetViewer, entity: &Entity<SpreadsheetViewer>) ->
 }
 
 fn summary_box(viewer: &SpreadsheetViewer, entity: &Entity<SpreadsheetViewer>) -> Div {
-    let summary = viewer
-        .active_sheet()
-        .summary_for_range(viewer.selection.range);
-    let metric_value = summary_metric_value(summary, viewer.summary_metric);
+    let sheet = viewer.active_sheet();
+    let summary = sheet.summary_for_range(viewer.selection.range);
+    let shared_format = sheet.common_numeric_format_in_range(viewer.selection.range);
+    let metric_value = summary_metric_value(summary, viewer.summary_metric, shared_format.as_ref());
     let main_entity: Entity<SpreadsheetViewer> = (*entity).clone();
     let mut box_el = div()
         .h_full()
@@ -3046,6 +3047,7 @@ fn summary_box(viewer: &SpreadsheetViewer, entity: &Entity<SpreadsheetViewer>) -
 fn summary_metric_value(
     summary: crate::workbook::SelectionSummary,
     metric: SummaryMetric,
+    shared_format: Option<&CellDisplayFormat>,
 ) -> String {
     let value = match metric {
         SummaryMetric::Sum => Some(summary.sum),
@@ -3056,7 +3058,15 @@ fn summary_metric_value(
         SummaryMetric::Max => summary.max,
     };
 
-    value.map_or_else(|| "-".to_owned(), display_summary_number)
+    value.map_or_else(
+        || "-".to_owned(),
+        |value| {
+            shared_format.map_or_else(
+                || display_summary_number(value),
+                |format| format.format_number(value),
+            )
+        },
+    )
 }
 
 fn display_summary_number(value: f64) -> String {

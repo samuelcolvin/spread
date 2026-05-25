@@ -658,6 +658,36 @@ impl SheetData {
         summary
     }
 
+    /// Display format shared by every numeric cell in `range`. Returns `None`
+    /// if the cells disagree, none are numeric, or the sheet isn't fully loaded
+    /// (in which case we don't have per-cell formats without forcing a load).
+    pub(crate) fn common_numeric_format_in_range(
+        &self,
+        range: CellRange,
+    ) -> Option<CellDisplayFormat> {
+        if !self.is_fully_loaded() {
+            return None;
+        }
+
+        let range = range.normalized();
+        let mut shared: Option<CellDisplayFormat> = None;
+        for row_ix in range.start.row..=range.end.row {
+            for col_ix in range.start.col..=range.end.col {
+                if self.numeric_value(row_ix, col_ix).is_none() {
+                    continue;
+                }
+                let cell = self.cell_data(row_ix, col_ix);
+                let format = cell.display_format?;
+                match &shared {
+                    Some(existing) if existing != &format => return None,
+                    Some(_) => {}
+                    None => shared = Some(format),
+                }
+            }
+        }
+        shared
+    }
+
     pub(crate) fn range_to_tsv(&self, range: CellRange) -> String {
         debug_assert!(self.supports_full_range_operations());
         let range = range.normalized();
@@ -1399,7 +1429,7 @@ pub(crate) fn display_float(value: f64) -> String {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CellDisplayFormat {
     Currency { decimals: usize },
     Percentage { decimals: usize },
@@ -2069,6 +2099,69 @@ mod tests {
         assert!((summary.sum - 4.0).abs() < f64::EPSILON);
         assert_eq!(summary.min, Some(1.0));
         assert_eq!(summary.max, Some(3.0));
+    }
+
+    #[test]
+    fn common_numeric_format_reflects_uniform_cells_and_rejects_mixes() {
+        let currency = CellDisplayFormat::Currency { decimals: 0 };
+        let percentage = CellDisplayFormat::Percentage { decimals: 1 };
+        let numeric_with = |raw: f64, format: Option<CellDisplayFormat>| CellData {
+            value: format!("{raw}"),
+            raw_value: CellRawValue::Number(raw),
+            display_format: format,
+            ..Default::default()
+        };
+        let text = CellData {
+            value: "label".to_owned(),
+            raw_value: CellRawValue::Text,
+            ..Default::default()
+        };
+
+        let sheet = SheetData::new(
+            Some("Sheet1".to_owned()),
+            vec![
+                vec![
+                    numeric_with(10.0, Some(currency.clone())),
+                    text.clone(),
+                    numeric_with(20.0, Some(currency.clone())),
+                ],
+                vec![
+                    numeric_with(0.5, Some(percentage.clone())),
+                    numeric_with(30.0, Some(currency.clone())),
+                    numeric_with(40.0, None),
+                ],
+            ],
+            Vec::new(),
+            Vec::new(),
+            DEFAULT_COLUMN_WIDTH,
+            DEFAULT_ROW_HEIGHT,
+        );
+
+        // Uniform currency cells (text is ignored) → currency.
+        let uniform = sheet.common_numeric_format_in_range(CellRange::new(
+            CellCoord::new(0, 0),
+            CellCoord::new(0, 2),
+        ));
+        assert_eq!(uniform, Some(currency.clone()));
+
+        // Currency + percentage in the range → no shared format.
+        let mixed = sheet.common_numeric_format_in_range(CellRange::new(
+            CellCoord::new(0, 0),
+            CellCoord::new(1, 1),
+        ));
+        assert_eq!(mixed, None);
+
+        // Any numeric cell without a format breaks the share too.
+        let unformatted_mix = sheet.common_numeric_format_in_range(CellRange::new(
+            CellCoord::new(0, 0),
+            CellCoord::new(1, 2),
+        ));
+        assert_eq!(unformatted_mix, None);
+
+        // No numeric cells → None (caller falls back to the default formatter).
+        let no_numbers =
+            sheet.common_numeric_format_in_range(CellRange::single(CellCoord::new(0, 1)));
+        assert_eq!(no_numbers, None);
     }
 
     #[test]
