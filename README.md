@@ -36,7 +36,7 @@ Features:
   <em>Example of rendering large Parquet file</em>
 </p>
 
-## Usage
+## Install
 
 Install the binary locally:
 
@@ -47,6 +47,23 @@ make install-macos
 (If you're not on macOS, your mileage may vary, try `make install-cli` instead.)
 
 On macOS, this also installs `Spread.app` to `~/Applications`, registers it with Finder, and sets it as the default app for `.xlsx`, `.csv`, and `.parquet` when [`duti`](https://github.com/moretension/duti) is installed. Without `duti`, use Finder's Get Info panel to choose Spread and click "Change All...".
+
+### macOS build requirements
+
+`gpui` compiles Metal shaders at build time, so full Xcode (not just the Command Line Tools) is required. If the build fails with `unable to find utility "metal"` or `missing Metal Toolchain`, run:
+
+1. Install Xcode from the [Mac App Store](https://apps.apple.com/app/xcode/id497799835) (free, ~10 GB).
+2. Launch it once and accept the license, then continue with the Metal Toolchain setup:
+
+```sh
+sudo xcodebuild -license accept
+sudo xcode-select -s /Applications/Xcode.app/Contents/Developer
+xcodebuild -downloadComponent MetalToolchain   # required on recent macOS even with Xcode installed
+xcrun metal --version                          # verify the toolchain is reachable
+cargo clean && make install-macos
+```
+
+## Usage
 
 Then open a file with:
 
